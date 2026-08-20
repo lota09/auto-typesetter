@@ -120,6 +120,10 @@ def main():
     p.add_argument("--eta", type=float, default=0.75,
                    help="뱅크에 없는 인물로 판정하는 임계값. 낮추면 이름을 더 적게 붙인다")
     p.add_argument("--no-ocr", action="store_true", help="검출·귀속만 하고 OCR 은 건너뛴다")
+    p.add_argument("--text-threshold", type=float,
+                   help="텍스트 검출 임계값 (기본 0.3). 낮추면 놓친 글자를 더 잡지만 "
+                        "오검출이 는다. do_chapter_wide_prediction 이 이 값을 인자로 "
+                        "받지 않아서 내부 메서드를 감싸 주입한다")
     args = p.parse_args()
 
     pages = []
@@ -145,6 +149,17 @@ def main():
 
     t0 = time.time()
     model = AutoModel.from_pretrained(MODEL_ID, trust_remote_code=True).to(device).eval()
+
+    if args.text_threshold is not None:
+        # 상류 API 가 임계값을 위로 노출하지 않는다. 기본값만 바꿔 감싼다.
+        _orig = model.predict_detections_and_associations
+
+        def _patched(images, *a, **kw):
+            kw.setdefault("text_detection_threshold", args.text_threshold)
+            return _orig(images, *a, **kw)
+
+        model.predict_detections_and_associations = _patched
+        print(f"텍스트 검출 임계값 {args.text_threshold} (기본 0.3)")
     print(f"모델 로드 {time.time()-t0:.1f}초 ({len(pages)}장에 1회)", flush=True)
 
     sizes = [Image.open(p).size for p in pages]

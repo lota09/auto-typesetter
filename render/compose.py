@@ -20,6 +20,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 
 import cv2
@@ -27,6 +28,8 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bubble import typeset_rect  # noqa: E402
+from glyph_size import measure_from_mask  # noqa: E402
 from make_mask import mask_for_box  # noqa: E402
 
 DEFAULT_FONT = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
@@ -58,6 +61,89 @@ def wrap_to_box(draw, text, font, max_w):
     return out
 
 
+def measured_glyph_px(img, t, mask_fn):
+    """원문 글자 크기를 **측정**한다. 실패하면 None.
+
+    말풍선 크기와 완전히 독립이다. 획 마스크의 투영 프로파일에서 글줄 방향의
+    봉우리 폭을 재므로, 박스 여백이나 OCR 글자 수 오류에 영향받지 않는다.
+
+    실측 비교 (maid2 p03): 측정 54~56px 로 거의 균일했는데, 면적 역산은 63~77px
+    로 흩어지며 20~40% 과대했다. 같은 작품의 대사는 원래 크기가 일정하다.
+    """
+    m, _ = mask_fn(img, t["bbox"])
+    if m is None:
+        return None
+    g, _dirn, _why = measure_from_mask(m)
+    return g
+
+
+def source_glyph_px(t):
+    """원문 글자 하나의 크기를 **면적에서** 역산한다.
+
+    아무도 글자 크기를 알려주지 않는다 — Magi 는 좌표만 주고 VLM 은 글자만 읽는다.
+    하지만 박스 넓이를 원문 글자 수로 나누면 글자 하나가 차지한 면적이 나오고,
+    그 제곱근이 글자 크기다. CJK 는 정사각형에 가까워 이 근사가 잘 맞는다.
+
+        g ≈ sqrt(박스 넓이 / 글자 수)
+
+    처음에는 `박스 폭 ÷ 열 수` 로 구했는데, 병합 단계가 크롭 패스의 ocr_columns
+    를 넘겨주지 않아 열 수가 늘 1 이 되었고 **박스 폭 전체를 글자 하나로** 봤다.
+    추정값이 133px 로 부풀어 모든 대사가 말풍선을 넘쳤다. 면적 기반은 그런 부속
+    정보에 기대지 않는다. 세로쓰기·가로쓰기를 가릴 필요도 없다.
+    """
+    x1, y1, x2, y2 = t["bbox"]
+    area = max(1.0, (x2 - x1) * (y2 - y1))
+    src = (t.get("ocr") or "").strip()
+    n = len(re.sub(r"\s+", "", src))
+    if n < 1:
+        return None
+    return (area / n) ** 0.5
+
+
+def measured_base(img_by_page, pages, mask_fn, cv_reject=0.5):
+    """측정값의 중앙값을 기준 크기로. 이상치는 버린다.
+
+    측정이 늘 되는 것은 아니다. 획이 잡음처럼 흩어진 박스에서는 봉우리 폭이
+    제각각이라 엉뚱한 값이 나온다 (실측에서 10px 이 한 번 나왔다). 중앙값에서
+    크게 벗어난 값은 빼고 센다.
+    """
+    import statistics
+    vals = []
+    for pg in pages:
+        img = img_by_page.get(pg["index"])
+        if img is None:
+            continue
+        for t in pg["texts"]:
+            if not (t.get("target") or "").strip() or t.get("kind") == "sfx":
+                continue
+            g = measured_glyph_px(img, t, mask_fn)
+            if g:
+                vals.append(g)
+    if not vals:
+        return None
+    med = statistics.median(vals)
+    kept = [v for v in vals if abs(v - med) <= med * cv_reject]
+    return statistics.median(kept) if kept else med
+
+
+def base_glyph_px(pages, scope):
+    """기준 글자 크기 = 추정값의 중앙값.
+
+    최대한 크게 채우는 방식은 글자 수와 말풍선 크기의 우연한 조합이 크기를
+    정한다. 실측에서 한 페이지 안에 34~64pt, 1.9 배 차이가 났고 같은 5 자짜리
+    대사가 34pt 와 64pt 로 갈렸다. 사람이 조판하면 그렇게 하지 않는다 — 한 작품의
+    대사 크기는 대체로 일정하고 말풍선이 거기 맞춰 그려진다.
+
+    챕터 단위가 더 일관되지만, 회상처럼 의도적으로 작게 쓴 페이지를 뭉갤 수 있어
+    scope 로 고를 수 있게 둔다.
+    """
+    import statistics
+    vals = [g for pg in pages for t in pg["texts"]
+            if (t.get("target") or "").strip() and t.get("kind") != "sfx"
+            for g in [source_glyph_px(t)] if g]
+    return statistics.median(vals) if vals else None
+
+
 def fit_text(draw, text, box_w, box_h, font_path, max_size, min_size, line_gap):
     """박스에 들어가는 가장 큰 글자 크기를 이분 탐색한다."""
     best = None
@@ -78,6 +164,43 @@ def fit_text(draw, text, box_w, box_h, font_path, max_size, min_size, line_gap):
     return best
 
 
+def area_cap(box_w, box_h, text, fill=0.85):
+    """이 자리에 이 글자 수를 넣을 때 가능한 최대 글자 크기.
+
+    원문 크기를 추정할 때 쓴 것과 **같은 공식의 대칭**이다. 원문은 넓이를 글자
+    수로 나눠 크기를 역산했고, 여기서는 번역문이 필요로 하는 넓이로 상한을 낸다.
+
+        cap = sqrt(자리 넓이 / 글자 수) × fill
+
+    fill 은 여백·줄간격·줄바꿈 낭비를 감안한 것이다. 완벽하게 채울 수는 없다.
+
+    이 상한이 있어야 하는 이유: 기준 크기만 고집하면 좁은 말풍선에서 한 줄에 한두
+    글자만 들어가 세로로 쌓인다. 크기가 균일해도 그렇게 되면 못 읽는다. 자리의
+    실제 크기가 상한을 정해야 한다.
+    """
+    n = max(1, len(re.sub(r"\s+", "", text)))
+    return max(1.0, ((box_w * box_h) / n) ** 0.5 * fill)
+
+
+def fit_at_base(draw, text, box_w, box_h, font_path, base_size, fill,
+                line_gap, max_size, min_size):
+    """기준 크기와 자리 상한 중 작은 쪽에서 시작해, 실제로 들어갈 때까지 줄인다.
+
+    인위적인 바닥은 두지 않는다. 상한이 자리에서 나오므로 억지로 크게 유지할
+    이유가 없고, 그렇게 하면 글자가 세로로 쌓인다.
+    """
+    top = int(min(max_size, base_size, area_cap(box_w, box_h, text, fill)))
+    top = max(min_size, top)
+    for size in range(top, min_size - 1, -1):
+        font = ImageFont.truetype(font_path, size)
+        lines = wrap_to_box(draw, text, font, box_w)
+        if len(lines) * int(size * line_gap) <= box_h:
+            return font, lines, int(size * line_gap), False
+    font = ImageFont.truetype(font_path, min_size)
+    lines = wrap_to_box(draw, text, font, box_w)
+    return font, lines, int(min_size * line_gap), True
+
+
 def main():
     p = argparse.ArgumentParser(description="지우기 + 번역문 조판")
     p.add_argument("--translated-json", required=True)
@@ -90,8 +213,18 @@ def main():
     p.add_argument("--max-font", type=int, default=64)
     p.add_argument("--min-font", type=int, default=11)
     p.add_argument("--line-gap", type=float, default=1.18)
+    p.add_argument("--size-scope", choices=["page", "chapter", "off"], default="chapter",
+                   help="기준 글자 크기를 어디서 낼지. off 면 예전처럼 최대한 크게")
+    p.add_argument("--size-scale", type=float, default=1.0,
+                   help="추정한 원문 크기에 곱할 배수. 한글이 원문보다 크게 보이면 낮춘다")
+    p.add_argument("--size-fill", type=float, default=0.85,
+                   help="자리 넓이를 글자가 채우는 비율. 낮추면 여유롭게 조판된다")
     p.add_argument("--margin", type=float, default=0.06,
                    help="박스 안쪽 여백 비율. 글자가 말풍선 선에 닿지 않게 한다")
+    p.add_argument("--no-bubble", action="store_true",
+                   help="말풍선 검출을 끄고 텍스트 박스에 그대로 조판한다")
+    p.add_argument("--bubble-tol", type=int, default=18,
+                   help="flood fill 색 허용치. 크면 말풍선 밖으로 샌다")
     p.add_argument("--skip-kinds", nargs="*", default=["sfx"],
                    help="이 종류는 지우지도 얹지도 않는다 (효과음은 조판이 따로 필요)")
     args = p.parse_args()
@@ -99,6 +232,25 @@ def main():
     doc = json.load(open(args.translated_json, encoding="utf-8"))
     os.makedirs(args.out_dir, exist_ok=True)
     inpaint_flag = {"telea": cv2.INPAINT_TELEA, "ns": cv2.INPAINT_NS}.get(args.inpaint)
+
+    mask_fn = lambda im, bb: mask_for_box(im, bb, 0.12, 12, 0.35, 3, 5)
+    chapter_base = None
+    if args.size_scope == "chapter":
+        imgs = {}
+        for pg in doc["pages"]:
+            if args.pages and (pg["index"] + 1) not in args.pages:
+                continue
+            im = cv2.imread(pg["file"], cv2.IMREAD_COLOR)
+            if im is not None:
+                imgs[pg["index"]] = im
+        chapter_base = measured_base(imgs, [pg for pg in doc["pages"]
+                                            if pg["index"] in imgs], mask_fn)
+        src = "측정"
+        if not chapter_base:
+            chapter_base = base_glyph_px(doc["pages"], "chapter")
+            src = "면적 역산(측정 실패)"
+        if chapter_base:
+            print(f"챕터 기준 글자 크기 {chapter_base * args.size_scale:.0f}px [{src}]")
 
     for pg in doc["pages"]:
         pno = pg["index"] + 1
@@ -135,17 +287,34 @@ def main():
         # ⑨ 조판 — PIL 로 넘겨 한글을 그린다
         pil = Image.fromarray(cv2.cvtColor(cleaned, cv2.COLOR_BGR2RGB))
         draw = ImageDraw.Draw(pil)
-        placed = 0
+        page_base = base_glyph_px([pg], "page") if args.size_scope == "page" else None
+        placed = widened = overflow = 0
         for t in targets:
-            x1, y1, x2, y2 = (int(round(v)) for v in t["bbox"])
+            # 지우기는 텍스트 박스로, **조판은 말풍선 안쪽 사각형으로** 한다.
+            # 세로쓰기 원문의 길쭉한 박스에 가로쓰기 한국어를 넣으면 한두 글자씩
+            # 끊겨 쌓인다. 말풍선을 찾으면 가로로 자연스럽게 퍼진다.
+            if args.no_bubble:
+                rect, used = tuple(int(round(v)) for v in t["bbox"]), False
+            else:
+                rect, used = typeset_rect(img, t["bbox"], tol=args.bubble_tol)
+            widened += bool(used)
+            x1, y1, x2, y2 = rect
             bw, bh = x2 - x1, y2 - y1
             mx = int(bw * args.margin)
             my = int(bh * args.margin)
             iw, ih = max(8, bw - 2 * mx), max(8, bh - 2 * my)
 
-            font, lines, lh = fit_text(draw, t["target"].strip(), iw, ih,
-                                       args.font, args.max_font, args.min_font,
-                                       args.line_gap)
+            base = chapter_base if args.size_scope == "chapter" else page_base
+            if base:
+                font, lines, lh, of = fit_at_base(
+                    draw, t["target"].strip(), iw, ih, args.font,
+                    base * args.size_scale, args.size_fill, args.line_gap,
+                    args.max_font, args.min_font)
+                overflow += of
+            else:
+                font, lines, lh = fit_text(draw, t["target"].strip(), iw, ih,
+                                           args.font, args.max_font, args.min_font,
+                                           args.line_gap)
             total_h = len(lines) * lh
             cy = y1 + my + max(0, (ih - total_h) // 2)
             for ln in lines:
@@ -158,7 +327,8 @@ def main():
         stem = os.path.splitext(os.path.basename(pg["file"]))[0]
         dest = os.path.join(args.out_dir, f"{stem}_ko.jpg")
         pil.convert("RGB").save(dest, quality=92)
-        print(f"  p{pno:02d} 번역 {placed}개 얹음 | 마스크 {100.0*(mask>0).sum()/(H*W):.2f}% → {dest}")
+        print(f"  p{pno:02d} 번역 {placed}개 (말풍선 {widened}, 넘침 {overflow}) | "
+              f"마스크 {100.0*(mask>0).sum()/(H*W):.2f}% → {dest}")
     return 0
 
 
