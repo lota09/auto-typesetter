@@ -1,0 +1,4 @@
+# 이미지 변환에 사용하는 검증된 오픈소스 프로젝트
+Pillow>=10.0.0            # https://github.com/python-pillow/Pillow  (JPEG/PNG/WEBP/GIF/TIFF/BMP/ICO ...)
+pillow-heif>=0.15.0       # https://github.com/bigcat88/pillow_heif  (HEIC/HEIF, libheif 바인딩)
+pillow-avif-plugin>=1.4.0 # https://github.com/fdintino/pillow-avif-plugin  (AVIF, 선택 사항)

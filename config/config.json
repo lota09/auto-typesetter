@@ -1,0 +1,75 @@
+{
+  "_comment": [
+    "파이프라인의 모델 배치. 단계마다 어느 모델을 쓸지 stages 에서 정한다.",
+    "로컬 llama-server 는 라우터 모드로 띄우면 요청의 model 필드로 온디맨드 교체된다",
+    "(config/models.ini 참조). 그래서 단계별로 다른 모델을 써도 서버를 재기동하지 않는다.",
+    "실측 교체 비용: 콜드 적재 26초, 교체 41초.",
+    "",
+    "다른 백엔드로 가려면 backends 에 항목을 추가하고 models 에서 그 backend 를 가리키면 된다.",
+    "우리 호출은 전부 OpenAI 호환 /v1/chat/completions 라 base_url 과 인증만 다르다.",
+    "다만 '추론 끄기' 방법은 제공자마다 달라서 thinking_style 로 구분한다 —",
+    "이 파이프라인에서 추출 단계의 추론을 끄는 것은 선택이 아니라 필수다.",
+    "추론형 모델은 토큰 예산을 사고에 다 쓰고 본문을 비운 채 돌려준다."
+  ],
+  "backends": {
+    "local": {
+      "base_url": "http://127.0.0.1:8081/v1",
+      "api_key_env": null,
+      "thinking_style": "llama_cpp",
+      "supports_json_schema": true,
+      "timeout": 1800
+    },
+    "openai": {
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "thinking_style": "reasoning_effort",
+      "supports_json_schema": true,
+      "timeout": 600
+    },
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "thinking_style": "none",
+      "supports_json_schema": true,
+      "timeout": 600
+    },
+    "local8080": {
+      "base_url": "http://127.0.0.1:8080/v1",
+      "api_key_env": null,
+      "thinking_style": "llama_cpp",
+      "supports_json_schema": true,
+      "timeout": 1800
+    }
+  },
+  "models": {
+    "qwen-vl": {
+      "backend": "local",
+      "model": "qwen-vl",
+      "vision": true,
+      "max_image_pixels": null,
+      "note": "판독 담당. 실측에서 페이지 판독이 크롭 기준선과 53% 일치 (Gemma 17%)"
+    },
+    "gemma": {
+      "backend": "local",
+      "model": "gemma",
+      "vision": true,
+      "max_image_pixels": 645120,
+      "note": "텍스트 추론·번역 담당. 비전 상한 0.65MP 라 페이지 판독에는 쓰지 않는다"
+    },
+    "qwen38": {
+      "backend": "local8080",
+      "model": "qwen38",
+      "vision": true,
+      "max_image_pixels": null,
+      "note": "Qwen3.8-27B ABLITERATED Q6_K, 밀집 27B, ctx 82304"
+    }
+  },
+  "stages": {
+    "read_page": "qwen-vl",
+    "read_texts": "qwen-vl",
+    "styleguide": "gemma",
+    "translate": "gemma",
+    "repair": "gemma",
+    "judge": "gemma"
+  }
+}
