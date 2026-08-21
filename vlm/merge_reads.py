@@ -56,6 +56,11 @@ def main():
 
     crop_ocr = {(pg["index"], t["id"]): (t.get("ocr") or "").strip()
                 for pg in crop["pages"] for t in pg["texts"]}
+    # 열 정보도 함께 옮긴다. 크롭 패스가 세로쓰기 순서를 지키려고 나눠둔 것인데,
+    # 뒤 단계(글자 크기 추정)가 열 수를 쓸 수 있다. 안 넘겨서 열 수가 늘 1 로
+    # 잡히는 버그가 있었다.
+    crop_cols = {(pg["index"], t["id"]): (t.get("ocr_columns") or [])
+                 for pg in crop["pages"] for t in pg["texts"]}
 
     n = disagree = filled = 0
     for pg in doc["pages"]:
@@ -66,6 +71,9 @@ def main():
             lang = t.get("lang") or pg.get("source_lang")
 
             t["ocr_crop"], t["ocr_page"] = c or None, g or None
+            cols = crop_cols.get((pg["index"], t["id"]))
+            if cols:
+                t["ocr_columns"] = cols
             text, src = pick(c, g, lang, args.prefer)
             t["ocr"], t["ocr_source"] = text, src
             if text:

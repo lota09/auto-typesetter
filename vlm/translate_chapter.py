@@ -107,7 +107,7 @@ in these lines, no matter how peer-like the relationship looks.
 Below is the full chapter transcript. Each line is:
   <key> [lang/kind] speaker -> addressee : source text
 
-The speakers are often visual descriptions ("silver-haired maid") because names
+{cast_block}The speakers are often visual descriptions ("silver-haired maid") because names
 were not yet known. Your job is to build a style guide BEFORE any translation.
 
 Field meanings — get these the right way round:
@@ -289,6 +289,23 @@ def main():
         # 원문에서 경어 표지를 세어 증거로 준다. 모델이 사회적 추론으로 이걸
         # 뒤집는 일이 실제로 있었다 ("동료이고 나이가 비슷하니 반말" → 원문은
         # 극존대). 증거를 주면 추론할 여지가 없어진다.
+        # build_cast.py 가 이미 인물을 확정했으면 시트가 다시 정하게 두지 않는다.
+        # 두 단계가 독립적으로 신원을 해소하면 결과가 어긋난다 — 실제로 한쪽은
+        # `cat` 을 Pirate Girl 로, 다른 쪽은 Kumin 으로 합친 적이 있다.
+        settled = (doc.get("cast") or {}).get("characters") or []
+        cast_block = ""
+        if settled:
+            lines = []
+            for c in settled:
+                al = ", ".join(a for a in (c.get("aliases") or [])
+                               if a.lower() != c["id"].lower())
+                lines.append(f"  {c['id']}" + (f"  (also appears as: {al})" if al else ""))
+            cast_block = ("SETTLED CAST — these identities were already resolved from the\n"
+                          "full chapter. Use exactly these as displayName. Do not merge them,\n"
+                          "split them, or invent new characters.\n\n"
+                          + "\n".join(lines) + "\n\n")
+            print(f"확정된 인물 {len(settled)}명을 시트에 물려줍니다")
+
         acc = evidence_by_speaker(doc)
         evidence = render_evidence(acc)
         print("측정된 말투 증거:\n" + evidence)
@@ -300,7 +317,8 @@ def main():
         # 추론을 끄고 한 번 더 시도한다. 실패로 끝내는 것보다 낫다.
         try:
             sg = ask(sheet_client,
-                     STYLEGUIDE_PROMPT.format(transcript=transcript, evidence=evidence),
+                     STYLEGUIDE_PROMPT.format(transcript=transcript, evidence=evidence,
+                                          cast_block=cast_block),
                      STYLEGUIDE_SCHEMA, "styleguide",
                      args.sheet_max_tokens, not args.no_sheet_thinking)
         except RuntimeError as e:
@@ -308,7 +326,8 @@ def main():
                 raise
             print(f"  시트 생성이 예산을 소진했습니다 ({e}). 추론을 끄고 재시도합니다")
             sg = ask(sheet_client,
-                     STYLEGUIDE_PROMPT.format(transcript=transcript, evidence=evidence),
+                     STYLEGUIDE_PROMPT.format(transcript=transcript, evidence=evidence,
+                                          cast_block=cast_block),
                      STYLEGUIDE_SCHEMA, "styleguide",
                      args.sheet_max_tokens, False)
 

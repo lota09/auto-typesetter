@@ -62,6 +62,34 @@
       "vision": true,
       "max_image_pixels": null,
       "note": "Qwen3.8-27B ABLITERATED Q6_K, 밀집 27B, ctx 82304"
+    },
+    "q38-uncens": {
+      "backend": "local",
+      "model": "q38-uncens",
+      "vision": true,
+      "max_image_pixels": null,
+      "note": "Qwen3.8 Uncensored Q6_K_P — abliterated 와 비교용"
+    },
+    "q38-unsloth-q6": {
+      "backend": "local",
+      "model": "q38-unsloth-q6",
+      "vision": true,
+      "max_image_pixels": null,
+      "note": "Qwen3.8 unsloth UD-Q6_K_XL — 정렬 미조작 원본"
+    },
+    "q38-unsloth-q4": {
+      "backend": "local",
+      "model": "q38-unsloth-q4",
+      "vision": true,
+      "max_image_pixels": null,
+      "note": "Qwen3.8 unsloth UD-Q4_K_M — 같은 계열 양자화 비교"
+    },
+    "q38-ablit": {
+      "backend": "local",
+      "model": "q38-ablit",
+      "vision": true,
+      "max_image_pixels": null,
+      "note": "Qwen3.8 ABLITERATED Q6_K — 이미 측정됨 (81.3%)"
     }
   },
   "stages": {

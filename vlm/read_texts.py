@@ -28,8 +28,10 @@ import os
 import sys
 import time
 
-import requests
 from PIL import Image
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from backend import client_for  # noqa: E402
 
 # 프롬프트를 영어로 쓴다. 한국어로 지시했더니 출력이 한국어 문자로 끌려갔다
 # (あ → 아, 的 → の). 지시문의 언어가 전사 결과의 문자 체계를 오염시킨다.
@@ -95,32 +97,15 @@ def to_data_url(image):
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
-def read_one(session, url, image, prompt, timeout, temperature, max_tokens, thinking):
-    payload = {
-        "messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": to_data_url(image)}},
-            {"type": "text", "text": prompt},
-        ]}],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        # 전사는 창의성이 필요 없다. 샘플링을 최대한 죽인다.
-        "top_p": 1.0,
-        "stream": False,
-    }
-    if not thinking:
-        # 추론형 모델이라 기본값으로는 토큰 예산을 전부 사고에 쓰고 본문을 못 내는
-        # 일이 생긴다 (finish_reason=length, content=''). 전사에 추론은 불필요하고,
-        # 끄고 비교해도 결과가 같았다.
-        payload["chat_template_kwargs"] = {"enable_thinking": False}
+def read_one(client, image, prompt, max_tokens, thinking):
+    """크롭 하나를 전사한다. HTTP 조립과 추론 제어는 backend.Client 가 맡는다.
 
-    r = session.post(url, json=payload, timeout=timeout)
-    r.raise_for_status()
-    choice = r.json()["choices"][0]
-    content = (choice["message"].get("content") or "").strip()
-    if not content and choice.get("finish_reason") == "length":
-        raise RuntimeError("토큰 예산 소진 전에 본문이 나오지 않았습니다 "
-                           "(--max-tokens 를 올리거나 --thinking 을 끄세요)")
-    return content
+    라우터 모드는 요청에 model 이 없으면 400 을 낸다. 직접 post 하면 안 된다.
+    """
+    return client.chat(
+        [{"type": "image_url", "image_url": {"url": to_data_url(image)}},
+         {"type": "text", "text": prompt}],
+        thinking=thinking, max_tokens=max_tokens, temperature=0.0)
 
 
 def join_columns(text):
@@ -137,8 +122,8 @@ def main():
     p = argparse.ArgumentParser(description="Magi 박스를 VLM 으로 전사")
     p.add_argument("--magi-json", required=True, help="magi_worker.py 출력")
     p.add_argument("--out", required=True, help="ocr 을 채운 JSON 경로")
-    p.add_argument("--server", default="http://127.0.0.1:8081",
-                   help="llama-server 주소 (기본 %(default)s)")
+    p.add_argument("--config")
+    p.add_argument("--model", help="stages 설정을 무시하고 이 모델을 쓴다")
     p.add_argument("--pad", type=float, default=0.15,
                    help="박스 짧은 변 대비 여백 비율 (기본 %(default)s)")
     p.add_argument("--min-side", type=int, default=896,
@@ -148,6 +133,11 @@ def main():
                    help="크롭 긴 변 상한. 크게 두면 느려진다")
     p.add_argument("--script-hint", default=DEFAULT_SCRIPT_HINT,
                    help="원문 문자 체계 힌트. 소재가 바뀌면 이걸 바꾼다")
+    p.add_argument("--fill-from",
+                   help="이미 전사된 JSON. **비어 있는 박스만** 읽는다. 싸고 빠른 "
+                        "엔진(manga-ocr)으로 먼저 훑고 실패분만 VLM 으로 넘기는 "
+                        "하이브리드에 쓴다 — 실측에서 manga-ocr 이 25배 빠르지만 "
+                        "회수율이 낮아, 둘을 합치면 양쪽 장점을 다 가진다")
     p.add_argument("--limit", type=int, help="앞에서 N 개만 처리 (검증용)")
     p.add_argument("--pages", type=int, nargs="+", help="이 페이지 번호(1-base)만 처리")
     p.add_argument("--dump-crops", help="보낸 크롭을 저장할 디렉터리 (검증용)")
@@ -159,30 +149,47 @@ def main():
     args = p.parse_args()
 
     doc = json.load(open(args.magi_json, encoding="utf-8"))
-    url = args.server.rstrip("/") + "/v1/chat/completions"
-
-    session = requests.Session()
-    try:
-        h = session.get(args.server.rstrip("/") + "/health", timeout=10)
-        if h.status_code != 200:
-            print(f"서버가 준비되지 않았습니다 ({h.status_code}): {h.text[:200]}", file=sys.stderr)
-            return 3
-    except requests.RequestException as e:
-        print(f"서버에 연결할 수 없습니다: {e}", file=sys.stderr)
+    client = client_for("read_texts", args.config, args.model)
+    if not client.health():
+        print(f"백엔드에 연결할 수 없습니다: {client.base_url}", file=sys.stderr)
         return 3
+    print(f"모델: {client.name}")
 
     if args.dump_crops:
         os.makedirs(args.dump_crops, exist_ok=True)
+
+    prefilled = {}
+    if args.fill_from:
+        src = json.load(open(args.fill_from, encoding="utf-8"))
+        for pg in src["pages"]:
+            for t in pg["texts"]:
+                if (t.get("ocr") or "").strip():
+                    prefilled[(pg["index"], t["id"])] = (t["ocr"], t.get("ocr_columns") or [])
+        # 이미 읽힌 것을 결과에 옮겨 둔다. 남은 것만 VLM 이 읽는다.
+        for pg in doc["pages"]:
+            for t in pg["texts"]:
+                got = prefilled.get((pg["index"], t["id"]))
+                if got:
+                    t["ocr"], t["ocr_columns"] = got[0], got[1]
+                    t["ocr_source_engine"] = src.get("read_pass", {}).get("engine", "prefill")
+        print(f"기존 전사 {len(prefilled)}개를 이어받습니다")
 
     jobs = []  # (page_record, text_record) 순서대로
     for page in doc["pages"]:
         if args.pages and (page["index"] + 1) not in args.pages:
             continue
         for t in page["texts"]:
+            if args.fill_from and (page["index"], t["id"]) in prefilled:
+                continue
             jobs.append((page, t))
     if args.limit:
         jobs = jobs[:args.limit]
     if not jobs:
+        if args.fill_from:
+            with open(args.out, "w", encoding="utf-8") as fh:
+                json.dump(doc, fh, ensure_ascii=False, indent=1)
+            print(f"채울 것이 없습니다 → {args.out}")
+            return 0
         print("처리할 텍스트가 없습니다", file=sys.stderr)
         return 2
 
@@ -202,8 +209,7 @@ def main():
             piece.save(os.path.join(args.dump_crops,
                                     f"p{page['index']+1:03d}_t{t['id']:03d}.png"))
         try:
-            raw = read_one(session, url, piece, prompt, args.timeout,
-                           args.temperature, args.max_tokens, args.thinking)
+            raw = read_one(client, piece, prompt, args.max_tokens, args.thinking)
         except Exception as e:
             t["ocr"] = None
             t["ocr_error"] = f"{type(e).__name__}: {e}"
@@ -223,7 +229,7 @@ def main():
               f"{'대사' if t['essential'] else '기타'} | {shown[:60]}", flush=True)
 
     doc["read_pass"] = {
-        "server": args.server, "pad": args.pad,
+        "model": client.name, "pad": args.pad,
         "min_side": args.min_side, "max_side": args.max_side,
         "script_hint": args.script_hint,
         "prompt_sha": __import__("hashlib").sha256(prompt.encode()).hexdigest()[:12],

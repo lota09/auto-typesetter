@@ -28,7 +28,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bubble import typeset_rect  # noqa: E402
+from bubble import typeset_rect_multi  # noqa: E402
 from glyph_size import measure_from_mask  # noqa: E402
 from make_mask import mask_for_box  # noqa: E402
 
@@ -296,7 +296,7 @@ def main():
             if args.no_bubble:
                 rect, used = tuple(int(round(v)) for v in t["bbox"]), False
             else:
-                rect, used = typeset_rect(img, t["bbox"], tol=args.bubble_tol)
+                rect, used = typeset_rect_multi(img, t["bbox"])
             widened += bool(used)
             x1, y1, x2, y2 = rect
             bw, bh = x2 - x1, y2 - y1

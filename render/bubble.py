@@ -129,6 +129,31 @@ def largest_inscribed_rect(mask, downscale=4):
     return (x1 * downscale, y1 * downscale, x2 * downscale, y2 * downscale)
 
 
+TOL_LADDER = (12, 18, 26, 36)
+
+
+def typeset_rect_multi(img, bbox, min_gain=1.15, tols=TOL_LADDER, **kw):
+    """허용치를 여러 개 시도해 가장 넓은 유효 사각형을 고른다.
+
+    실패 원인이 반대 방향으로 갈리기 때문이다 (실측 92 개 중):
+      대비 부족 9 개  — 허용치가 작아 말풍선 안에서 멈춘다 → 키워야 한다
+      번짐 유출 7 개  — 허용치가 커서 페이지로 샌다 → 줄여야 한다
+    고정값 하나로 둘 다 맞출 수 없다. 사다리로 훑고 **안전 검사를 통과한 것 중
+    가장 넓은 것**을 쓴다. 유출은 기존 면적 검사가 걸러내므로 큰 값을 시도해도
+    위험이 늘지 않는다.
+    """
+    best, best_area, used = None, 0, False
+    x1, y1, x2, y2 = (int(round(v)) for v in bbox)
+    for tol in tols:
+        rect, ok = typeset_rect(img, bbox, min_gain=min_gain, tol=tol, **kw)
+        if not ok:
+            continue
+        area = (rect[2] - rect[0]) * (rect[3] - rect[1])
+        if area > best_area:
+            best, best_area, used = rect, area, True
+    return (best, True) if used else ((x1, y1, x2, y2), False)
+
+
 def typeset_rect(img, bbox, min_gain=1.15, **kw):
     """조판할 사각형을 돌려준다. 말풍선을 못 찾으면 원래 박스를 그대로.
 

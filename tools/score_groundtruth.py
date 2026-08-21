@@ -142,7 +142,12 @@ def align_by_text(page_boxes, bubbles, min_sim=0.25):
 def main():
     p = argparse.ArgumentParser(description="정답 대조 채점")
     p.add_argument("--ours", required=True, help="우리 파이프라인 출력 JSON")
-    p.add_argument("--gt", required=True, help="pc_groundtruth.py 출력 JSON")
+    p.add_argument("--gt", required=True, help="pc_groundtruth.py 출력 (대상 언어)")
+    p.add_argument("--pivot-gt",
+                   help="정렬용 원문 정답. 번역 채점은 이걸 써야 한다 — 우리 한국어와 "
+                        "공식 한국어를 글자로 맞추면 좋은 번역이라도 표현이 다르면 "
+                        "짝이 안 지어져 표본이 편향된다. 원문끼리 맞추고 그 인덱스로 "
+                        "대상 언어를 가져오면 표현 차이와 무관하게 정렬된다")
     p.add_argument("--mode", choices=["transcription", "translation"], required=True)
     p.add_argument("--field", help="비교할 우리 쪽 필드 (기본: ocr/target)")
     p.add_argument("--min-sim", type=float, default=0.25,
@@ -153,6 +158,8 @@ def main():
     global FIELD
     ours = json.load(open(args.ours, encoding="utf-8"))
     gt = json.load(open(args.gt, encoding="utf-8"))
+    pivot = json.load(open(args.pivot_gt, encoding="utf-8")) if args.pivot_gt else None
+    pivot_pages = {g["page"]: g["bubbles"] for g in pivot["pages"]} if pivot else None
     field = args.field or ("ocr" if args.mode == "transcription" else "target")
     FIELD = field
     gt_pages = {g["page"]: g["bubbles"] for g in gt["pages"]}
@@ -168,7 +175,14 @@ def main():
         bubbles = gt_pages.get(pno)
         if bubbles is None:
             continue
-        pairs, leftover, missing = align_by_text(pg["texts"], bubbles, args.min_sim)
+        # 정렬은 원문(pivot)으로, 채점은 대상 언어(bubbles)로 한다.
+        align_against = pivot_pages.get(pno, bubbles) if pivot_pages else bubbles
+        if pivot_pages:
+            globals()["FIELD"] = "ocr"          # 정렬은 우리 원문 판독으로
+            pairs, leftover, missing = align_by_text(pg["texts"], align_against, args.min_sim)
+            globals()["FIELD"] = field
+        else:
+            pairs, leftover, missing = align_by_text(pg["texts"], bubbles, args.min_sim)
         box_over += len(leftover)
         box_under += len(missing)
         tot += len(bubbles)
@@ -176,6 +190,8 @@ def main():
             misses.append((pno, bubbles[i]["text"][:36]))
 
         for bi, boxes, _sim in pairs:
+            if bi >= len(bubbles):
+                continue
             b = bubbles[bi]
             matched += 1
             got = "".join((t.get(field) or "") for t in boxes)
