@@ -159,6 +159,22 @@ def main():
             if a:
                 alias_to_id[a.strip().lower()] = c["id"]
 
+    # 별칭이 실제로 **화자로 등장한 적 있는지** 확인한다.
+    # `cat` 을 Pirate Girl 로 합친 적이 있는데, 근거로 제시된 줄에서 `cat` 은
+    # 화자가 아니라 **수신자**였다. 호칭은 상대를 알려주는 것이지 화자를 알려주는
+    # 것이 아니다. 전사에 화자로 한 번도 안 나온 별칭은 병합 근거가 될 수 없다.
+    seen_speakers = {(t.get("speaker_name") or "").strip().lower()
+                     for t in keys.values()}
+    seen_speakers.discard("")
+    for c in res["characters"]:
+        bogus = [a for a in (c.get("aliases") or [])
+                 if a.strip().lower() not in seen_speakers
+                 and a.strip().lower() != c["id"].strip().lower()]
+        if bogus:
+            c["aliases"] = [a for a in (c.get("aliases") or []) if a not in bogus]
+            c.setdefault("rejected_aliases", []).extend(bogus)
+            print(f"  ⚠ {c['id']}: 화자로 등장한 적 없는 별칭 제거 {bogus}")
+
     # notPeople 을 그대로 믿으면 안 된다. 실측에서 17개 중 8개가 **방금 인물로
     # 병합한 별칭**이었고 6개는 박스 키(p1_t4)였다. 모델이 모순된 목록을 낸다.
     # 별칭으로 쓰인 것과 키 형태를 기계적으로 걸러낸다.

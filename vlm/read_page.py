@@ -251,8 +251,10 @@ def main():
     p.add_argument("--outline-width", type=int, default=4)
     p.add_argument("--font-size", type=int, default=44)
     p.add_argument("--dump-labelled", help="번호를 그린 페이지를 저장할 디렉터리")
-    p.add_argument("--max-tokens", type=int, default=4096)
+    p.add_argument("--max-tokens", type=int, default=8192)
     p.add_argument("--timeout", type=float, default=900)
+    p.add_argument("--no-resume", dest="resume", action="store_false",
+                   help="기존 출력이 있어도 처음부터 다시 판독한다")
     p.add_argument("--no-cast-memory", action="store_true",
                    help="페이지를 넘는 등장인물 명부를 쓰지 않는다 (A/B 비교용)")
     p.add_argument("--reask-on-disagreement", action="store_true", default=True,
@@ -273,8 +275,31 @@ def main():
     if args.dump_labelled:
         os.makedirs(args.dump_labelled, exist_ok=True)
 
+    done_pages = set()
+    if args.resume and os.path.exists(args.out):
+        try:
+            prev = json.load(open(args.out, encoding="utf-8"))
+            by_idx = {pg["index"]: pg for pg in prev["pages"]}
+            for pg in doc["pages"]:
+                old = by_idx.get(pg["index"])
+                # 판독이 실제로 채워진 페이지만 완료로 본다. read_error 가 있거나
+                # ocr 이 비었으면 다시 시도한다.
+                # read_skipped 는 두 번 시도하고 포기한 페이지다. 다시 시도하면
+                # 또 막히므로 완료로 취급한다. --no-resume 이면 처음부터 다시 한다.
+                if old and (old.get("read_skipped") or
+                            (not old.get("read_error") and
+                             any((t.get("ocr") or "").strip() for t in old["texts"]))):
+                    pg.update(old)
+                    done_pages.add(pg["index"])
+        except Exception as e:
+            print(f"기존 결과를 못 읽어 처음부터 갑니다: {e}", file=sys.stderr)
+    if done_pages:
+        print(f"이미 판독된 페이지 {len(done_pages)}장은 건너뜁니다")
+
+    failed = []
     targets = [pg for pg in doc["pages"]
-               if pg["texts"] and (not args.pages or (pg["index"] + 1) in args.pages)]
+               if pg["texts"] and pg["index"] not in done_pages
+               and (not args.pages or (pg["index"] + 1) in args.pages)]
     if not targets:
         print("처리할 페이지가 없습니다", file=sys.stderr)
         return 2
@@ -296,12 +321,31 @@ def main():
         if roster:
             instruction += CAST_HINT.format(cast=roster)
         t = time.time()
-        try:
-            rows = ask_page(client, data_url, instruction,
-                            args.max_tokens, args.thinking)
-        except Exception as e:
-            pg["read_error"] = f"{type(e).__name__}: {e}"
-            print(f"p{pg['index']+1} 실패: {e}", flush=True)
+        rows = None
+        for attempt, budget in enumerate((args.max_tokens, args.max_tokens * 2), 1):
+            try:
+                rows = ask_page(client, data_url, instruction, budget, args.thinking)
+                break
+            except Exception as e:
+                # 대부분 응답이 토큰 한도에서 잘려 JSON 이 깨진 경우다. 예산을
+                # 두 배로 주고 한 번 더 해본다.
+                if attempt == 1:
+                    print(f"p{pg['index']+1} 파싱 실패, 예산 2배로 재시도: {e}", flush=True)
+                    continue
+                # 여기까지 오면 두 번 다 실패한 것이다. 대사가 거의 없는 페이지에서
+                # 모델이 응답을 조기에 끊는 일이 있었는데(1 개 박스, 52 자에서 절단)
+                # 예산을 늘려도 같았다. 영구 실패로 보고 **글자 없는 페이지로 확정**
+                # 한다. 그러지 않으면 재실행마다 같은 페이지에서 막힌다.
+                pg["read_error"] = f"{type(e).__name__}: {e}"
+                pg["read_skipped"] = True
+                for t in pg["texts"]:
+                    t.setdefault("ocr", None)
+                    t.setdefault("speaker_name", None)
+                    t.setdefault("kind", None)
+                failed.append(pg["index"] + 1)
+                print(f"p{pg['index']+1} 두 번 실패 — 글자 없는 페이지로 넘깁니다: {e}",
+                      flush=True)
+        if rows is None:
             continue
 
         def index_rows(rs):
@@ -396,9 +440,16 @@ def main():
     if cast.render():
         print("\n[등장인물 명부]\n" + cast.render())
     doc["cast"] = cast.entries
+    doc["read_failures"] = failed
     print(f"\n페이지 {done}/{len(targets)} 처리, 박스 누락 {missing_total}개  "
           f"({time.time()-t0:.1f}초) → {args.out}")
-    return 0 if done == len(targets) else 1
+    if failed:
+        print(f"건너뛴 페이지 {len(failed)}장: {failed}  "
+              f"— 다시 실행하면 이 페이지만 재시도합니다")
+    # 페이지 실패로 단계를 실패시키지 않는다. 산출물을 썼으면 성공이다.
+    # 재개로 실패 페이지 하나만 남았을 때 done==0 이 되어 파이프라인이 멈추는
+    # 문제가 있었다 — 영구 실패 페이지 하나 때문에 72 장이 막혔다.
+    return 0
 
 
 if __name__ == "__main__":

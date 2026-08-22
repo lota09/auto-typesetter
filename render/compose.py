@@ -35,6 +35,37 @@ from make_mask import mask_for_box  # noqa: E402
 DEFAULT_FONT = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 
 
+# 줄 앞에 혼자 올 수 없는 글자 (닫는 부호·문장부호). 앞줄 끝에 붙여야 한다.
+NO_LINE_START = "…‥。、．，!?！？)]}』」〉》”’·~〜ー・"
+# 줄 끝에 혼자 올 수 없는 글자 (여는 부호).
+NO_LINE_END = "([{『「〈《“‘"
+
+
+def _fix_orphans(lines):
+    """문장부호가 줄 머리에 혼자 오는 것을 앞줄로 당긴다.
+
+    `네 … 네.` 가 `네` / `…` / `네.` 로 쪼개져 나오는 것을 막는다. 조판에서
+    금칙 처리라 부르는 규칙이고, 없으면 부호 한 글자가 줄을 통째로 차지한다.
+    """
+    out = []
+    for ln in lines:
+        if out and ln and ln[0] in NO_LINE_START:
+            # 앞줄로 옮길 수 있는 만큼 당긴다.
+            k = 0
+            while k < len(ln) and ln[k] in NO_LINE_START:
+                k += 1
+            out[-1] += ln[:k]
+            ln = ln[k:].lstrip()
+            if not ln:
+                continue
+        while ln and out and out[-1] and out[-1][-1] in NO_LINE_END:
+            out[-1] = out[-1][:-1]
+            ln = out[-1][-1:] + ln if False else ln
+            break
+        out.append(ln)
+    return [l for l in out if l]
+
+
 def wrap_to_box(draw, text, font, max_w):
     """한국어는 공백 단위로 끊되, 한 낱말이 폭을 넘으면 글자 단위로 쪼갠다."""
     lines, cur = [], ""
@@ -58,7 +89,7 @@ def wrap_to_box(draw, text, font, max_w):
             ln = ln[cut:]
         if ln:
             out.append(ln)
-    return out
+    return _fix_orphans(out)
 
 
 def measured_glyph_px(img, t, mask_fn):
@@ -162,6 +193,59 @@ def fit_text(draw, text, box_w, box_h, font_path, max_size, min_size, line_gap):
         font = ImageFont.truetype(font_path, min_size)
         best = (font, wrap_to_box(draw, text, font, box_w), int(min_size * line_gap))
     return best
+
+
+def _overlap_ratio(a, b):
+    x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+    x2, y2 = min(a[2], b[2]), min(a[3], b[3])
+    ov = max(0, x2 - x1) * max(0, y2 - y1)
+    small = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    return ov / small if small > 0 else 0.0
+
+
+def split_shared_rects(placements, thresh=0.5):
+    """같은 말풍선을 배정받은 대사들을 위아래로 나눠 겹치지 않게 한다.
+
+    세로쓰기 원문에서는 Magi 가 한 말풍선의 열을 **별개 박스**로 잡는 일이 있다.
+    그런데 말풍선 검출은 박스마다 따로 도니, 두 박스가 각각 같은 말풍선을 찾아
+    거의 같은 자리를 받는다 (실측 겹침 92%, 99%). 각자 그 한가운데 그리면 글자가
+    포개져 판독 불가가 된다.
+
+    가로쓰기 서양 레이아웃(ep11)에서는 말풍선당 박스가 하나라 드러나지 않았다.
+    말풍선 확장 기능이 만든 회귀다.
+
+    나누는 방향은 위아래다. 한국어는 가로쓰기라 폭을 줄이면 줄바꿈이 망가지지만
+    높이는 나눠도 읽는 순서가 유지된다. 몫은 글자 수에 비례해 준다.
+    """
+    used = [False] * len(placements)
+    for i in range(len(placements)):
+        if used[i]:
+            continue
+        group = [i]
+        for j in range(i + 1, len(placements)):
+            if used[j]:
+                continue
+            if _overlap_ratio(placements[i][0], placements[j][0]) >= thresh:
+                group.append(j)
+        if len(group) == 1:
+            continue
+        for k in group:
+            used[k] = True
+        # 원문 읽는 순서(박스 id)대로 위에서 아래로 배치한다.
+        group.sort(key=lambda k: placements[k][1])
+        x1 = min(placements[k][0][0] for k in group)
+        y1 = min(placements[k][0][1] for k in group)
+        x2 = max(placements[k][0][2] for k in group)
+        y2 = max(placements[k][0][3] for k in group)
+        weights = [max(1, placements[k][2]) for k in group]
+        total = sum(weights)
+        top = y1
+        for k, wgt in zip(group, weights):
+            share = int((y2 - y1) * wgt / total)
+            placements[k] = ((x1, top, x2, min(y2, top + share)),
+                             placements[k][1], placements[k][2])
+            top += share
+    return placements
 
 
 def area_cap(box_w, box_h, text, fill=0.85):
@@ -289,15 +373,19 @@ def main():
         draw = ImageDraw.Draw(pil)
         page_base = base_glyph_px([pg], "page") if args.size_scope == "page" else None
         placed = widened = overflow = 0
+        # 자리를 먼저 전부 정하고 겹침을 푼다. 하나씩 그리면서 정하면 뒤에 오는
+        # 대사가 앞 대사 위에 겹쳐 그려진다.
+        placements = []
         for t in targets:
-            # 지우기는 텍스트 박스로, **조판은 말풍선 안쪽 사각형으로** 한다.
-            # 세로쓰기 원문의 길쭉한 박스에 가로쓰기 한국어를 넣으면 한두 글자씩
-            # 끊겨 쌓인다. 말풍선을 찾으면 가로로 자연스럽게 퍼진다.
             if args.no_bubble:
                 rect, used = tuple(int(round(v)) for v in t["bbox"]), False
             else:
                 rect, used = typeset_rect_multi(img, t["bbox"])
             widened += bool(used)
+            placements.append((rect, t.get("id", 0), len((t.get("target") or "").strip())))
+        placements = split_shared_rects(placements)
+
+        for t, (rect, _id, _n) in zip(targets, placements):
             x1, y1, x2, y2 = rect
             bw, bh = x2 - x1, y2 - y1
             mx = int(bw * args.margin)
