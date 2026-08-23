@@ -29,7 +29,10 @@ import json
 import os
 import re
 import sys
+import threading
 import time
+
+from concurrent.futures import ThreadPoolExecutor
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -242,6 +245,27 @@ def ask_page(client, data_url, instruction, max_tokens, thinking):
     )["regions"]
 
 
+
+def index_rows(rs):
+    out = {}
+    for row in rs:
+        try:
+            out[int(row["id"])] = row
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def spoken_ids(idx):
+    return {i for i, r in idx.items()
+            if (r.get("kind") or "") in ("dialogue", "thought")}
+
+
+def speaker_count(idx):
+    return len({(r.get("speaker") or "").strip() for i, r in idx.items()
+                if i in spoken_ids(idx) and (r.get("speaker") or "").strip()})
+
+
 def main():
     p = argparse.ArgumentParser(description="페이지 단위 전사 + 화자 판정")
     p.add_argument("--magi-json", required=True)
@@ -264,6 +288,10 @@ def main():
                    help="Magi 와 화자 수가 어긋나면 Magi 그룹핑을 힌트로 다시 묻는다")
     p.add_argument("--no-reask", dest="reask_on_disagreement", action="store_false",
                    help="교차 검증 재질의를 끈다")
+    p.add_argument("--workers", type=int, default=4,
+                   help="동시에 던질 페이지 수. **--no-cast-memory 일 때만** 적용된다 "
+                        "— 명부를 물려주면 페이지 N 이 1..N-1 에 의존하므로 순서를 "
+                        "지켜야 한다. 실측 4에서 1.5배(56.1→36.9초)")
     p.add_argument("--thinking", action="store_true",
                    help="추론을 켠다. 화자 판정에는 도움이 될 수 있으나 느리다")
     args = p.parse_args()
@@ -318,7 +346,21 @@ def main():
     t0 = time.time()
     done = missing_total = 0
     cast = Cast()
-    for pg in targets:
+    out_lock = threading.Lock()
+
+    # 페이지 판독을 두 국면으로 나눈다.
+    #
+    #   ① 모델에 묻는 부분  — 페이지끼리 독립이라 **동시에** 던질 수 있다
+    #   ② 상태를 바꾸는 부분 — 명부 누적·카운터·필드 대입. **페이지 순서대로** 한다
+    #
+    # 이렇게 갈라야 동시성이 결과를 바꾸지 않는다. cast.observe 를 스레드에서
+    # 부르면 명부에 페이지가 들어가는 순서가 실행마다 달라진다.
+    #
+    # ①을 동시에 던져도 되는 것은 파이프라인이 --no-cast-memory 로 부르기
+    # 때문이다. 그 플래그가 없으면 페이지 N 이 1..N-1 의 명부를 받으므로
+    # 순차 의존이 생긴다 — 그때는 아래에서 workers 를 1 로 되돌린다.
+    def query_page(pg):
+        """모델에 묻기만 한다. 공유 상태를 건드리지 않는다."""
         n = len(pg["texts"])
         ids = [t["id"] for t in pg["texts"]]
         page_img = Image.open(pg["file"])
@@ -341,7 +383,9 @@ def main():
                 # 대부분 응답이 토큰 한도에서 잘려 JSON 이 깨진 경우다. 예산을
                 # 두 배로 주고 한 번 더 해본다.
                 if attempt == 1:
-                    print(f"p{pg['index']+1} 파싱 실패, 예산 2배로 재시도: {e}", flush=True)
+                    with out_lock:
+                        print(f"p{pg['index']+1} 파싱 실패, 예산 2배로 재시도: {e}",
+                              flush=True)
                     continue
                 # 여기까지 오면 두 번 다 실패한 것이다. 대사가 거의 없는 페이지에서
                 # 모델이 응답을 조기에 끊는 일이 있었는데(1 개 박스, 52 자에서 절단)
@@ -349,24 +393,16 @@ def main():
                 # 한다. 그러지 않으면 재실행마다 같은 페이지에서 막힌다.
                 pg["read_error"] = f"{type(e).__name__}: {e}"
                 pg["read_skipped"] = True
-                for t in pg["texts"]:
-                    t.setdefault("ocr", None)
-                    t.setdefault("speaker_name", None)
-                    t.setdefault("kind", None)
-                failed.append(pg["index"] + 1)
-                print(f"p{pg['index']+1} 두 번 실패 — 글자 없는 페이지로 넘깁니다: {e}",
-                      flush=True)
+                for t2 in pg["texts"]:
+                    t2.setdefault("ocr", None)
+                    t2.setdefault("speaker_name", None)
+                    t2.setdefault("kind", None)
+                with out_lock:
+                    print(f"p{pg['index']+1} 두 번 실패 — 글자 없는 페이지로 넘깁니다: {e}",
+                          flush=True)
+                return None
         if rows is None:
-            continue
-
-        def index_rows(rs):
-            out = {}
-            for row in rs:
-                try:
-                    out[int(row["id"])] = row
-                except (KeyError, TypeError, ValueError):
-                    continue
-            return out
+            return None
 
         by_id = index_rows(rows)
 
@@ -375,14 +411,6 @@ def main():
         # 답하는 13개 박스를 VLM 이 한 사람으로 몰아버린 페이지에서 Magi 는 2명을
         # 셌고, 반대로 Magi 가 남녀를 한 인물로 병합한 페이지에서는 VLM 이 맞았다.
         # 어느 쪽도 권위는 없지만 **수의 불일치는 이 페이지를 믿을 수 없다는 신호**다.
-        def spoken_ids(idx):
-            return {i for i, r in idx.items()
-                    if (r.get("kind") or "") in ("dialogue", "thought")}
-
-        def speaker_count(idx):
-            return len({(r.get("speaker") or "").strip() for i, r in idx.items()
-                        if i in spoken_ids(idx) and (r.get("speaker") or "").strip()})
-
         spoken = spoken_ids(by_id)
         grouping, magi_n = magi_grouping(pg["texts"], spoken)
         vlm_n = speaker_count(by_id)
@@ -391,8 +419,9 @@ def main():
         comparable = len(spoken) >= 2 and magi_n > 0
         agreed = (not comparable) or magi_n == vlm_n
         if not agreed and args.reask_on_disagreement and grouping:
-            print(f"p{pg['index']+1} 화자 수 불일치 (Magi {magi_n} vs VLM {vlm_n}) → 재질의",
-                  flush=True)
+            with out_lock:
+                print(f"p{pg['index']+1} 화자 수 불일치 "
+                      f"(Magi {magi_n} vs VLM {vlm_n}) → 재질의", flush=True)
             try:
                 rows2 = ask_page(
                     client, data_url,
@@ -405,14 +434,35 @@ def main():
                 # 남긴다 — 힌트가 오히려 화자를 쪼개게 만들 수도 있다.
                 if by2 and abs(n2 - magi_n) < abs(vlm_n - magi_n):
                     by_id, vlm_n = by2, n2
-                    print(f"  → 재질의 채택 (VLM {n2}명)", flush=True)
+                    msg = f"  → 재질의 채택 (VLM {n2}명)"
                 else:
-                    print(f"  → 재질의 기각 (VLM {n2}명, 개선 없음)", flush=True)
+                    msg = f"  → 재질의 기각 (VLM {n2}명, 개선 없음)"
             except Exception as e:
-                print(f"  → 재질의 실패, 원본 유지: {e}", flush=True)
-        pg["speaker_agreement"] = {"magi": magi_n, "vlm": vlm_n,
-                                   "spoken_boxes": len(spoken),
-                                   "agreed": (magi_n == vlm_n) if comparable else None}
+                msg = f"  → 재질의 실패, 원본 유지: {e}"
+            with out_lock:
+                print(msg, flush=True)
+        return {"by_id": by_id, "magi_n": magi_n, "vlm_n": vlm_n,
+                "spoken": spoken, "comparable": comparable,
+                "sent_size": sent_size, "seconds": time.time() - t, "n": n}
+
+    # ① 묻기. --no-cast-memory 일 때만 동시에 던진다.
+    workers = args.workers if args.no_cast_memory else 1
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(query_page, targets))
+    else:
+        results = [query_page(pg) for pg in targets]
+
+    # ② 반영. 페이지 순서대로 — 여기서만 공유 상태를 바꾼다.
+    for pg, r in zip(targets, results):
+        if r is None:
+            failed.append(pg["index"] + 1)
+            continue
+        by_id, n = r["by_id"], r["n"]
+        pg["speaker_agreement"] = {"magi": r["magi_n"], "vlm": r["vlm_n"],
+                                   "spoken_boxes": len(r["spoken"]),
+                                   "agreed": (r["magi_n"] == r["vlm_n"])
+                                             if r["comparable"] else None}
 
         cast.observe(pg["index"] + 1, list(by_id.values()))
 
@@ -440,7 +490,8 @@ def main():
         print(f"p{pg['index']+1} {n}개 박스 → 언어 {pg['source_lang']}, "
               f"화자 {len({t['speaker_name'] for t in pg['texts'] if t.get('speaker_name')})}명"
               f"{f', 누락 {miss}' if miss else ''}  "
-              f"({time.time()-t:.1f}초, 전송 {sent_size[0]}x{sent_size[1]})", flush=True)
+              f"({r['seconds']:.1f}초, 전송 {r['sent_size'][0]}x{r['sent_size'][1]})",
+              flush=True)
 
     doc["read_page_pass"] = {"model": client.name, "max_side": args.max_side,
                              "cast_memory": not args.no_cast_memory}

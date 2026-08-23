@@ -26,7 +26,10 @@ import io
 import json
 import os
 import sys
+import threading
 import time
+
+from concurrent.futures import ThreadPoolExecutor
 
 from PIL import Image
 
@@ -146,6 +149,12 @@ def main():
     p.add_argument("--thinking", action="store_true",
                    help="모델의 추론을 켠다. 전사 품질은 같고 훨씬 느려진다")
     p.add_argument("--timeout", type=float, default=180)
+    p.add_argument("--workers", type=int, default=4,
+                   help="동시에 던질 요청 수. 박스끼리 독립이라 늘릴 수 있다. "
+                        "실측 4에서 2.5배(59.5→23.8초), 8은 이득 없음. 출력은 "
+                        "바이트 단위로 동일했다. 서버(models.ini)의 parallel 은 "
+                        "**올릴 필요가 없다** — 이득은 GPU 배칭이 아니라 크롭·"
+                        "인코딩·HTTP 를 GPU 작업과 겹치는 데서 온다")
     args = p.parse_args()
 
     doc = json.load(open(args.magi_json, encoding="utf-8"))
@@ -204,13 +213,22 @@ def main():
     print(f"텍스트 {len(jobs)}개 전사 시작 "
           f"(pad={args.pad}, 크롭 긴 변 {args.min_side}~{args.max_side}px)")
     images = {}
+    img_lock = threading.Lock()      # 이미지 캐시는 스레드가 공유한다
+    out_lock = threading.Lock()      # 진행 로그가 서로 섞이지 않게
+    tally_lock = threading.Lock()
     t0 = time.time()
     ok = empty = fail = 0
-    for i, (page, t) in enumerate(jobs, 1):
+
+    def transcribe(job):
+        """박스 하나. 예외는 여기서 삼켜 다른 박스에 번지지 않게 한다."""
+        nonlocal ok, empty, fail
+        i, (page, t) = job
         path = page["file"]
-        if path not in images:
-            images[path] = Image.open(path).convert("RGB")
-        piece = crop(images[path], t["bbox"], args.pad, args.min_side, args.max_side)
+        with img_lock:
+            if path not in images:
+                images[path] = Image.open(path).convert("RGB")
+            img = images[path]
+        piece = crop(img, t["bbox"], args.pad, args.min_side, args.max_side)
 
         if args.dump_crops:
             piece.save(os.path.join(args.dump_crops,
@@ -220,20 +238,41 @@ def main():
         except Exception as e:
             t["ocr"] = None
             t["ocr_error"] = f"{type(e).__name__}: {e}"
-            fail += 1
-            print(f"  [{i}/{len(jobs)}] p{page['index']+1} t{t['id']} 실패: {e}", flush=True)
-            continue
+            with tally_lock:
+                fail += 1
+            with out_lock:
+                print(f"  [{i}/{len(jobs)}] p{page['index']+1} t{t['id']} 실패: {e}",
+                      flush=True)
+            return
 
         if raw == "EMPTY" or not raw:
             t["ocr"], t["ocr_columns"] = None, []
-            empty += 1
+            with tally_lock:
+                empty += 1
             shown = "(빈 박스)"
         else:
             t["ocr"], t["ocr_columns"] = join_columns(raw)
-            ok += 1
+            with tally_lock:
+                ok += 1
             shown = t["ocr"]
-        print(f"  [{i}/{len(jobs)}] p{page['index']+1} t{t['id']} "
-              f"{'대사' if t['essential'] else '기타'} | {shown[:60]}", flush=True)
+        with out_lock:
+            print(f"  [{i}/{len(jobs)}] p{page['index']+1} t{t['id']} "
+                  f"{'대사' if t['essential'] else '기타'} | {shown[:60]}", flush=True)
+
+    # 박스끼리 완전히 독립이라 동시에 던질 수 있다. 결과는 각자의 t 에 직접
+    # 쓰이므로 완료 순서는 상관없다 — 로그 순서만 섞인다.
+    #
+    # 기본값 1 은 예전 그대로다. 올리려면 **서버 슬롯도 함께** 올려야 한다
+    # (config/models.ini 의 parallel). 한쪽만 바꾸면 효과가 0 이다:
+    # 슬롯이 4개여도 클라이언트가 하나씩 보내면 3개는 계속 빈다.
+    # 근거와 측정 계획은 docs/PARALLELISM.md.
+    numbered = list(enumerate(jobs, 1))
+    if args.workers > 1:
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            list(pool.map(transcribe, numbered))
+    else:
+        for job in numbered:
+            transcribe(job)
 
     doc["read_pass"] = {
         "model": client.name, "pad": args.pad,

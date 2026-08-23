@@ -196,6 +196,12 @@ def main():
                         "텍스트 단계가 14배 빨라지면서 말투 오류 개수는 같았다(docs/MODELS.md). "
                         "값 없이 --thinking 만 주면 on. "
                         "auto=단계마다 옛 기본값(추출은 끄고 인물·시트는 켠다)")
+    p.add_argument("--workers", type=int, default=4,
+                   help="판독 두 단계에서 동시에 던질 요청 수. 페이지·박스가 서로 "
+                        "독립이라 겹쳐 던질 수 있다. 이득은 GPU 배칭이 아니라 "
+                        "크롭·인코딩·HTTP 를 GPU 작업과 겹치는 데서 온다 — "
+                        "서버(models.ini)의 parallel 은 올릴 필요가 없다. "
+                        "자세한 것은 docs/PARALLELISM.md")
     p.add_argument("--model-read", help="판독 두 단계(read_page/read_texts)의 모델을 강제한다")
     p.add_argument("--model-text",
                    help="텍스트 단계(cast/시트/번역/수정)의 모델을 강제한다")
@@ -227,6 +233,7 @@ def main():
     f = lambda n: os.path.join(w, n)
     think = lambda stage: thinking_flags(stage, args.thinking)
     model_read = ["--model", args.model_read] if args.model_read else []
+    workers = ["--workers", str(args.workers)]
     model_text = ["--model", args.model_text] if args.model_text else []
 
     start = 0 if args.only else STAGES.index(args.from_stage)
@@ -260,7 +267,7 @@ def main():
     if "read" in todo:
         if not run([MAGI_PY, os.path.join(ROOT, "vlm", "read_page.py"),
                     "--magi-json", f("magi.json"), "--out", f("page.json"),
-                    "--no-cast-memory"] + model_read + think("read_page")
+                    "--no-cast-memory"] + model_read + workers + think("read_page")
                    + ([] if args.resume else ["--no-resume"]),
                    "② 페이지 판독 (화자·언어)"):
             return 1
@@ -306,7 +313,7 @@ def main():
                 print("   이미 전사된 crop.json 이 있습니다 — 빈 박스만 읽습니다")
             if not run([MAGI_PY, os.path.join(ROOT, "vlm", "read_texts.py"),
                         "--magi-json", f("magi.json"), "--out", f("crop.json")]
-                       + fill + model_read + think("read_texts"),
+                       + fill + model_read + workers + think("read_texts"),
                        "② 크롭 전사 [VLM]"):
                 return 1
 

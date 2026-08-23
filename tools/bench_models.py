@@ -52,7 +52,15 @@ USAGE_RE = re.compile(r"\[usage\] calls=(\d+) prompt=(\d+) completion=(\d+)")
 
 
 def warm(model, timeout=900):
-    """모델을 미리 올려 둔다. 적재 시간이 측정에 섞이지 않게."""
+    """모델을 미리 올려 둔다. 적재 시간이 측정에 섞이지 않게.
+
+    **이것만으로는 부족하다.** 텍스트 1토큰 요청은 비전 경로(mmproj)를 건드리지
+    않아서, 모델 적재 후 **첫 이미지 요청**이 별도의 워밍업 비용을 문다.
+    실측 ep11_cn 34박스: 워밍업을 안 한 첫 실행 55초, 그다음 24초 —
+    **1회성 30초**가 첫 측정에 통째로 붙는다.
+    그래서 아래 warm_task() 로 과제 자체를 한 번 버리고 시작한다.
+    이걸 몰랐을 때 동시성 이득을 2.5배로 잘못 읽었다 (실제 1.17배).
+    """
     body = json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": "1"}],
@@ -67,6 +75,20 @@ def warm(model, timeout=900):
     except (urllib.error.URLError, TimeoutError) as e:
         return None, f"예열 실패: {e}"
     return time.time() - t, None
+
+
+def warm_task(args, model, wdir):
+    """측정할 과제를 그대로 한 번 돌리고 버린다.
+
+    비전 경로 워밍업은 해상도·경로마다 다를 수 있어, 흉내내는 것보다 **같은 일을
+    한 번 하는 것**이 확실하다. 결과는 쓰지 않는다.
+    """
+    if args.task != "transcribe":
+        return
+    out = os.path.join(wdir, "warm.json")
+    subprocess.run([PY, os.path.join(ROOT, "vlm", "read_texts.py"),
+                    "--magi-json", args.magi_json, "--out", out, "--model", model],
+                   capture_output=True, text=True)
 
 
 def run(cmd, log_path):
@@ -195,6 +217,8 @@ def main():
     p.add_argument("--gt", required=True)
     p.add_argument("--pivot-gt", help="text 채점의 정렬용 원문 정답")
     p.add_argument("--bench-dir", default="work/bench")
+    p.add_argument("--no-warm-task", action="store_true",
+                   help="과제 예열을 건너뛴다. 첫 측정이 비전 워밍업 비용을 문다")
     p.add_argument("--out", help="결과 JSON 경로 (기본: <bench-dir>/<task>.json)")
     args = p.parse_args()
 
@@ -216,6 +240,12 @@ def main():
             for th in args.thinking:
                 rows.append(((model, th), {"ok": False, "seconds": 0, "error": err}))
             continue
+        if not args.no_warm_task:
+            wdir0 = os.path.join(args.bench_dir, f"{args.task}_{model}_warm")
+            os.makedirs(wdir0, exist_ok=True)
+            wt = time.time()
+            warm_task(args, model, wdir0)
+            print(f"   과제 예열 {time.time()-wt:.0f}초 (버림)", flush=True)
         for th in args.thinking:
             wdir = os.path.join(args.bench_dir, f"{args.task}_{model}_{th}")
             os.makedirs(wdir, exist_ok=True)

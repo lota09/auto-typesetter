@@ -23,6 +23,7 @@ import json
 import os
 import re
 import sys
+import threading
 
 import requests
 
@@ -75,7 +76,11 @@ class Client:
         self.thinking_style = backend_cfg.get("thinking_style", "none")
         self.supports_json_schema = backend_cfg.get("supports_json_schema", True)
         self.timeout = backend_cfg.get("timeout", 1800)
-        self.session = requests.Session()
+        # 세션은 **스레드마다** 따로 둔다. requests.Session 은 스레드 안전이
+        # 보장되지 않는다 (커넥션 풀과 쿠키 저장소를 공유한다). 크롭 전사를
+        # 동시에 던지기 시작하면 그게 곧 간헐적이고 재현 안 되는 실패가 된다.
+        self._local = threading.local()
+        self._usage_lock = threading.Lock()
         # 호출 사용량을 쌓아 둔다. "추론을 켜면 느리다"를 시간이 아니라 토큰으로
         # 재기 위한 것이다 — 시간은 모델 적재·교체에 오염되지만 생성 토큰 수는
         # 그 모델이 실제로 얼마나 생각했는지만 말한다.
@@ -85,6 +90,13 @@ class Client:
         self.api_key = os.environ.get(key_env) if key_env else None
         if key_env and not self.api_key:
             raise ConfigError(f"백엔드가 {key_env} 환경변수를 요구합니다 (모델 {name})")
+
+    @property
+    def session(self):
+        sess = getattr(self._local, "session", None)
+        if sess is None:
+            sess = self._local.session = requests.Session()
+        return sess
 
     # ── 상태 확인 ────────────────────────────────────────────────────────
     def health(self):
@@ -172,9 +184,10 @@ class Client:
         r.raise_for_status()
         body = r.json()
         u = body.get("usage") or {}
-        self.usage["calls"] += 1
-        self.usage["prompt"] += u.get("prompt_tokens") or 0
-        self.usage["completion"] += u.get("completion_tokens") or 0
+        with self._usage_lock:
+            self.usage["calls"] += 1
+            self.usage["prompt"] += u.get("prompt_tokens") or 0
+            self.usage["completion"] += u.get("completion_tokens") or 0
         choice = body["choices"][0]
         finish = choice.get("finish_reason")
         text = (choice["message"].get("content") or "").strip()
