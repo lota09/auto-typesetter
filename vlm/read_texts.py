@@ -31,7 +31,7 @@ import time
 from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from backend import client_for  # noqa: E402
+from backend import client_for, usage_line  # noqa: E402
 
 # 프롬프트를 영어로 쓴다. 한국어로 지시했더니 출력이 한국어 문자로 끌려갔다
 # (あ → 아, 的 → の). 지시문의 언어가 전사 결과의 문자 체계를 오염시킨다.
@@ -186,6 +186,13 @@ def main():
         jobs = jobs[:args.limit]
     if not jobs:
         if args.fill_from:
+            # 채울 것이 없는데 같은 파일에 다시 쓰면 **mtime 만 밀린다.** 그러면
+            # 뒷단계의 is_fresh 가 "입력이 새로워졌다"고 보고 병합·인물·번역을
+            # 통째로 다시 돌린다. 재개하려고 넣은 기능이 재개를 무효화한 셈이라,
+            # 실제로 77페이지 챕터에서 끝나 있던 ④가 다시 돌아 터졌다.
+            if os.path.abspath(args.out) == os.path.abspath(args.fill_from):
+                print(f"채울 것이 없습니다 — {args.out} 를 그대로 둡니다")
+                return 0
             with open(args.out, "w", encoding="utf-8") as fh:
                 json.dump(doc, fh, ensure_ascii=False, indent=1)
             print(f"채울 것이 없습니다 → {args.out}")
@@ -241,6 +248,7 @@ def main():
     dt = time.time() - t0
     print(f"\n전사 {ok}개 / 빈 박스 {empty}개 / 실패 {fail}개  "
           f"({dt:.1f}초, {dt/len(jobs):.1f}초/개) → {args.out}")
+    print(usage_line(client))
     return 0 if fail == 0 else 1
 
 

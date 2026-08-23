@@ -47,49 +47,28 @@
       "model": "qwen-vl",
       "vision": true,
       "max_image_pixels": null,
-      "note": "판독 담당. 실측에서 페이지 판독이 크롭 기준선과 53% 일치 (Gemma 17%)"
+      "note": "판독 담당. Qwen3.6-35B-A3B Q8_K_P. 페이지 판독이 크롭 기준선과 53% 일치 (Gemma 17%)"
     },
     "gemma": {
       "backend": "local",
       "model": "gemma",
       "vision": true,
       "max_image_pixels": 645120,
-      "note": "텍스트 추론·번역 담당. 비전 상한 0.65MP 라 페이지 판독에는 쓰지 않는다"
-    },
-    "qwen38": {
-      "backend": "local8080",
-      "model": "qwen38",
-      "vision": true,
-      "max_image_pixels": null,
-      "note": "Qwen3.8-27B ABLITERATED Q6_K, 밀집 27B, ctx 82304"
+      "note": "텍스트 추론·번역 담당. Gemma4-26B-A4B QAT. 이전 빌드 비전 상한 0.65MP — 새 빌드는 재확인 필요"
     },
     "q38-uncens": {
       "backend": "local",
       "model": "q38-uncens",
       "vision": true,
       "max_image_pixels": null,
-      "note": "Qwen3.8 Uncensored Q6_K_P — abliterated 와 비교용"
+      "note": "Qwen3.8-27B Uncensored Q8_K_P — 판독 대조군"
     },
-    "q38-unsloth-q6": {
+    "gemma31": {
       "backend": "local",
-      "model": "q38-unsloth-q6",
+      "model": "gemma31",
       "vision": true,
-      "max_image_pixels": null,
-      "note": "Qwen3.8 unsloth UD-Q6_K_XL — 정렬 미조작 원본"
-    },
-    "q38-unsloth-q4": {
-      "backend": "local",
-      "model": "q38-unsloth-q4",
-      "vision": true,
-      "max_image_pixels": null,
-      "note": "Qwen3.8 unsloth UD-Q4_K_M — 같은 계열 양자화 비교"
-    },
-    "q38-ablit": {
-      "backend": "local",
-      "model": "q38-ablit",
-      "vision": true,
-      "max_image_pixels": null,
-      "note": "Qwen3.8 ABLITERATED Q6_K — 이미 측정됨 (81.3%)"
+      "max_image_pixels": 645120,
+      "note": "Gemma4-31B QAT 밀집 — 번역 대조군, 미측정"
     }
   },
   "stages": {

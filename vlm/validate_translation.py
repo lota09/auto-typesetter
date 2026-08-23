@@ -26,6 +26,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from backend import bound_schema, client_for  # noqa: E402
 from translate_chapter import render_styleguide, ask, TRANSLATION_SCHEMA  # noqa: E402
 
 import requests  # noqa: E402
@@ -277,12 +278,14 @@ JUDGE_SCHEMA = {
         "type": "object",
         "properties": {
             "key": {"type": "string"},
-            "requirement": {"type": "string"},
-            "problem": {"type": "string"},
+            "requirement": {"type": "string", "maxLength": 400},
+            "problem": {"type": "string", "maxLength": 400},
         },
         "required": ["key", "requirement", "problem"]}}},
     "required": ["findings"],
 }
+JUDGE_SCHEMA["properties"]["findings"]["maxItems"] = 200
+bound_schema(JUDGE_SCHEMA)
 
 JUDGE_PROMPT = """You are reviewing someone else's Korean translation of a comic
 chapter. You did not write it. Judge only whether it obeys the requirements below.
@@ -311,7 +314,7 @@ Lines:
 {items}"""
 
 
-def judge(session, url, sheet, boxes, timeout, max_tokens, thinking):
+def judge(client, sheet, boxes, max_tokens, thinking):
     """새 컨텍스트에서 번역을 판정한다.
 
     같은 세션에서 "네가 쓴 걸 검토해라" 하는 것과 다르다. 이 호출은 이전 대화도,
@@ -335,8 +338,8 @@ def judge(session, url, sheet, boxes, timeout, max_tokens, thinking):
                      f"{t.get('addressee') or '-'}\n"
                      f"    source: {t.get('ocr')}\n"
                      f"    korean: {tgt}")
-    res = ask(session, url, JUDGE_PROMPT.format(styleguide=sheet, items="\n".join(items)),
-              JUDGE_SCHEMA, "findings", timeout, max_tokens, thinking)
+    res = ask(client, JUDGE_PROMPT.format(styleguide=sheet, items="\n".join(items)),
+              JUDGE_SCHEMA, "findings", max_tokens, thinking)
     out = {}
     for f in res.get("findings") or []:
         key, req, prob = f.get("key"), (f.get("requirement") or "").strip(), \
@@ -362,7 +365,8 @@ def main():
     p.add_argument("--repair-temperature", type=float, default=0.25,
                    help="회차당 올릴 온도 (1회차는 0). 0 이면 그리디라 회차를 "
                         "반복해도 같은 출력이 나온다")
-    p.add_argument("--server", default="http://127.0.0.1:8081")
+    p.add_argument("--config")
+    p.add_argument("--model", help="stages 설정을 무시하고 이 모델을 쓴다")
     p.add_argument("--min-ratio", type=float, default=0.25)
     p.add_argument("--max-ratio", type=float, default=4.0)
     p.add_argument("--max-tokens", type=int, default=8192)
@@ -405,8 +409,8 @@ def main():
             print(f"    ✗ {code}: {msg}")
 
     sheet = render_styleguide(sg)
-    url = args.server.rstrip("/") + "/v1/chat/completions"
-    session = requests.Session()
+    repair_client = client_for("repair", args.config, args.model)
+    judge_client = client_for("judge", args.config, args.model)
 
     if args.repair and issues:
         for rnd in range(1, args.max_rounds + 1):
@@ -427,11 +431,11 @@ def main():
             nudge = ROUND_NUDGES[min(rnd - 1, len(ROUND_NUDGES) - 1)]
             print(f"\n[재요청 {rnd}회차] {len(items)}개 (temperature {temp:.2f})")
             try:
-                res = ask(session, url,
+                res = ask(repair_client,
                           REPAIR_PROMPT.format(styleguide=sheet, items="\n".join(items),
                                                extra=nudge),
                           TRANSLATION_SCHEMA, "translations",
-                          args.timeout, args.max_tokens, False, temperature=temp)
+                          args.max_tokens, False, temperature=temp)
             except Exception as e:
                 print(f"  재요청 실패: {e}")
                 break
@@ -474,8 +478,7 @@ def main():
     if args.harsh:
         print("\n[--harsh] 새 컨텍스트 판정자 실행")
         try:
-            found = judge(session, url, sheet, boxes, args.timeout,
-                          args.max_tokens, args.thinking)
+            found = judge(judge_client, sheet, boxes, args.max_tokens, args.thinking)
         except Exception as e:
             print(f"  판정 실패, 건너뜀: {e}")
             found = {}
@@ -495,11 +498,11 @@ def main():
                     f"    problem: {'; '.join(m for _, m in iss)}\n"
                     f"    required: {CODE_DIRECTIVES['judge']}")
             try:
-                res = ask(session, url,
+                res = ask(repair_client,
                           REPAIR_PROMPT.format(styleguide=sheet,
                                                items="\n".join(items), extra=""),
                           TRANSLATION_SCHEMA, "translations",
-                          args.timeout, args.max_tokens, False)
+                          args.max_tokens, False)
             except Exception as e:
                 print(f"  판정 후 재요청 실패: {e}")
                 res = {"translations": []}

@@ -33,43 +33,60 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import requests
 
-from backend import client_for  # noqa: E402
+from backend import bound_schema, client_for, usage_line  # noqa: E402
 from register_cues import (contradictions, evidence_by_speaker,  # noqa: E402
                             render_evidence)
 
 SPEECH_STYLES = ["neutral", "polite", "casual", "rough", "childish",
                  "elderly", "formal", "custom"]
 
+# 배열에는 반드시 상한을 준다.
+#
+# maxItems 가 없으면 문법이 배열의 끝을 강제하지 않는다. 그래서 모델이 항목을
+# 계속 뱉어도 아무것도 막지 못한다. 실제로 인물 6명짜리 챕터에서 시트가
+# **188,360자**까지 폭주했다 (전사 692줄을 보고 glossary 를 줄마다 만든 것으로
+# 보인다). 예산을 24576 → 49152 로 두 배 준 재시도도 똑같이 잘렸다 —
+# 예산 문제가 아니라 멈출 이유가 없는 것이 문제였다.
+#
+# llama.cpp 는 json_schema 를 GBNF 로 바꿔 **디코딩 중에** 강제하므로,
+# 상한은 프롬프트의 부탁이 아니라 물리적 제약이 된다.
+MAX_CHARACTERS = 40      # 실측 최대 19 (77페이지 챕터의 흩어진 라벨)
+MAX_GLOSSARY = 60
+MAX_REGISTER_TO = 20     # 인물 하나가 상대할 인물 수
+MAX_NOTE = 400           # 자유 서술 필드의 글자 수 상한
+
 STYLEGUIDE_SCHEMA = {
     "type": "object",
     "properties": {
-        "characters": {"type": "array", "items": {
+        "characters": {"type": "array", "maxItems": MAX_CHARACTERS, "items": {
             "type": "object",
             "properties": {
                 "displayName": {"type": "string"},
-                "sourceNames": {"type": "array", "items": {"type": "string"}},
+                "sourceNames": {"type": "array", "maxItems": 8,
+                                "items": {"type": "string"}},
                 "targetName": {"type": "string"},
-                "visualDescriptors": {"type": "array", "items": {"type": "string"}},
+                "visualDescriptors": {"type": "array", "maxItems": 8,
+                                      "items": {"type": "string"}},
                 "speechStyle": {"type": "string", "enum": SPEECH_STYLES},
-                "customSpeechStyle": {"type": "string"},
-                "registerTo": {"type": "array", "items": {
+                "customSpeechStyle": {"type": "string", "maxLength": MAX_NOTE},
+                "registerTo": {"type": "array", "maxItems": MAX_REGISTER_TO, "items": {
                     "type": "object",
                     "properties": {"toward": {"type": "string"},
                                    "koreanEnding": {"type": "string"},
-                                   "reason": {"type": "string"}},
+                                   "reason": {"type": "string", "maxLength": MAX_NOTE}},
                     "required": ["toward", "koreanEnding"]}},
-                "note": {"type": "string"},
+                "note": {"type": "string", "maxLength": MAX_NOTE},
             },
             "required": ["displayName", "targetName", "visualDescriptors",
                          "speechStyle", "registerTo"]}},
-        "glossary": {"type": "array", "items": {
+        "glossary": {"type": "array", "maxItems": MAX_GLOSSARY, "items": {
             "type": "object",
             "properties": {
                 "source": {"type": "string"}, "target": {"type": "string"},
                 "category": {"type": "string",
                              "enum": ["character", "alias", "place", "term",
                                       "honorific", "other"]},
-                "note": {"type": "string"}},
+                "note": {"type": "string", "maxLength": MAX_NOTE}},
             "required": ["source", "target", "category"]}},
         "rules": {
             "type": "object",
@@ -78,7 +95,7 @@ STYLEGUIDE_SCHEMA = {
                 "sfxMode": {"type": "string", "enum": ["preserve", "translate", "note"]},
                 "defaultTone": {"type": "string", "enum": ["natural_korean", "literal"]}},
             "required": ["honorifics", "sfxMode", "defaultTone"]},
-        "chapterSummary": {"type": "string"},
+        "chapterSummary": {"type": "string", "maxLength": 1500},
     },
     "required": ["characters", "glossary", "rules", "chapterSummary"],
 }
@@ -87,11 +104,18 @@ TRANSLATION_SCHEMA = {
     "type": "object",
     "properties": {"translations": {"type": "array", "items": {
         "type": "object",
-        "properties": {"key": {"type": "string"}, "target": {"type": "string"},
-                       "speaker": {"type": "string"}, "note": {"type": "string"}},
+        "properties": {"key": {"type": "string"},
+                       # 번역문은 대사 한 줄이라 기본 상한(80자)보다 길 수 있다.
+                       "target": {"type": "string", "maxLength": 600},
+                       "speaker": {"type": "string"},
+                       "note": {"type": "string", "maxLength": 300}},
         "required": ["key", "target"]}}},
     "required": ["translations"],
 }
+# 배치 하나가 60줄이지만 재요청(⑥)은 위반 박스를 한 번에 모아 보낸다. 넉넉히.
+TRANSLATION_SCHEMA["properties"]["translations"]["maxItems"] = 400
+bound_schema(TRANSLATION_SCHEMA)
+bound_schema(STYLEGUIDE_SCHEMA)
 
 STYLEGUIDE_PROMPT = """You are preparing to translate a comic chapter into Korean.
 
@@ -252,7 +276,17 @@ def main():
     p.add_argument("--config")
     p.add_argument("--sheet-model", help="시트 단계 모델 강제")
     p.add_argument("--translate-model", help="번역 단계 모델 강제")
-    p.add_argument("--max-tokens", type=int, default=8192)
+    p.add_argument("--max-tokens", type=int, default=8192,
+                   help="번역 배치 하나의 출력 예산")
+    p.add_argument("--batch-lines", type=int, default=60,
+                   help="번역을 몇 줄씩 끊어 요청할지. 출력이 줄 수에 비례하므로 "
+                        "긴 챕터는 반드시 끊어야 한다 (692줄이 한 번에 들어가 "
+                        "3만 토큰에서 잘린 적이 있다). 60줄이면 출력이 대략 "
+                        "3~4K 토큰이라 기본 예산 안에 든다")
+    p.add_argument("--batch-overlap", type=int, default=6,
+                   help="배치 앞에 맥락으로만 붙일 직전 줄 수 (번역하지 않는다)")
+    p.add_argument("--fill-rounds", type=int, default=2,
+                   help="빠진 줄을 다시 묻는 횟수. 0 이면 보충하지 않는다")
     p.add_argument("--timeout", type=float, default=1800)
     p.add_argument("--thinking", action="store_true",
                    help="번역 패스에서 추론을 켠다")
@@ -295,15 +329,18 @@ def main():
         settled = (doc.get("cast") or {}).get("characters") or []
         cast_block = ""
         if settled:
-            lines = []
+            # `lines` 라는 이름을 쓰지 말 것. 바깥의 챕터 전사 목록을 덮어쓴다 —
+            # 번역을 배치로 나누면서 그 목록을 뒤에서 쓰게 되어, 시트를 새로
+            # 만든 실행에서만 번역이 0개로 나오는 버그가 됐다.
+            roster = []
             for c in settled:
                 al = ", ".join(a for a in (c.get("aliases") or [])
                                if a.lower() != c["id"].lower())
-                lines.append(f"  {c['id']}" + (f"  (also appears as: {al})" if al else ""))
+                roster.append(f"  {c['id']}" + (f"  (also appears as: {al})" if al else ""))
             cast_block = ("SETTLED CAST — these identities were already resolved from the\n"
                           "full chapter. Use exactly these as displayName. Do not merge them,\n"
                           "split them, or invent new characters.\n\n"
-                          + "\n".join(lines) + "\n\n")
+                          + "\n".join(roster) + "\n\n")
             print(f"확정된 인물 {len(settled)}명을 시트에 물려줍니다")
 
         acc = evidence_by_speaker(doc)
@@ -372,11 +409,60 @@ def main():
     story_block = f"\nCHAPTER CONTEXT — what happens in this chapter:\n{story}\n" if story else ""
     if story:
         print(f"줄거리를 번역 맥락으로 사용합니다 ({len(story)}자)")
-    res = ask(tr_client,
-              TRANSLATE_PROMPT.format(styleguide=sheet, transcript=transcript,
-                                      story=story_block),
-              TRANSLATION_SCHEMA, "translations", args.max_tokens, args.thinking)
-    by_key = {r["key"]: r for r in res["translations"] if r.get("key")}
+    # 번역 출력은 **줄마다 한 항목**이라 챕터 길이에 그대로 비례한다. 시트와
+    # 달리 줄일 방법이 없다 — 모든 대사의 번역문이 결과에 있어야 한다.
+    # 692줄짜리 챕터에서 이 요청 하나가 3만 토큰을 넘겨 잘렸다. 그래서 나눈다.
+    #
+    # 나눠도 말투가 흔들리지 않는 이유가 2단 구조의 요점이다: 인물별 말투는
+    # 이미 **시트에 확정돼 있고**, 배치마다 그 시트를 통째로 준다. 배치가
+    # 정하는 것은 문장이지 말투가 아니다. 줄거리도 매번 함께 실어 맥락을 준다.
+    by_key = {}
+
+    def run_chunk(chunk, back, label):
+        """한 배치를 번역해 by_key 에 채운다. 채운 개수를 돌려준다."""
+        # 직전 줄 몇 개를 원문 그대로 붙여 대화의 흐름이 끊기지 않게 한다.
+        ctx = ("\nPRECEDING LINES (context only — do NOT translate these):\n"
+               + "\n".join(back) + "\n") if back else ""
+        if label:
+            print(f"  {label} {len(chunk)}줄", flush=True)
+        res = ask(tr_client,
+                  TRANSLATE_PROMPT.format(styleguide=sheet,
+                                          transcript="\n".join(chunk),
+                                          story=story_block + ctx),
+                  TRANSLATION_SCHEMA, "translations", args.max_tokens, args.thinking)
+        want = set(l.split(" ")[0] for l in chunk)
+        got = 0
+        for r in res["translations"]:
+            # 맥락으로 준 앞 줄까지 번역해 오는 경우가 있다. 배치 밖은 버린다.
+            if r.get("key") and r["key"] in want:
+                by_key[r["key"]] = r
+                got += 1
+        return got
+
+    batches = [(i, lines[i:i + args.batch_lines])
+               for i in range(0, len(lines), args.batch_lines)]
+    for n, (start, chunk) in enumerate(batches, 1):
+        run_chunk(chunk, lines[max(0, start - args.batch_overlap):start],
+                  f"[배치 {n}/{len(batches)}]" if len(batches) > 1 else "")
+
+    # 모델은 **짧은 항목을 몇 개씩 조용히 빠뜨린다.** 실측: 692줄 중 4개가 빠졌고
+    # 전부 1~5자였으며 그 배치는 60줄 238자로 가장 작은 축이었다. 규모 문제가
+    # 아니라 그냥 누락이다. 배치를 다시 돌릴 이유가 없으니 빠진 것만 모아 묻는다.
+    for rnd in range(1, args.fill_rounds + 1):
+        gaps = [l for l in lines if l.split(" ")[0] not in by_key]
+        if not gaps:
+            break
+        print(f"  [보충 {rnd}회차] 빠진 {len(gaps)}줄", flush=True)
+        before = len(by_key)
+        for i in range(0, len(gaps), args.batch_lines):
+            try:
+                run_chunk(gaps[i:i + args.batch_lines], [], "")
+            except Exception as e:
+                print(f"    보충 실패: {e}", file=sys.stderr)
+        if len(by_key) == before:
+            print("    더 이상 채워지지 않습니다 — 중단", flush=True)
+            break
+
     print(f"번역 {time.time()-t:.1f}초, {len(by_key)}/{len(keys)}개 응답")
 
     missing = []
@@ -397,10 +483,18 @@ def main():
     with open(args.out, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, ensure_ascii=False, indent=1)
 
-    if missing:
-        print(f"⚠️  번역 누락 {len(missing)}개: {missing[:10]}")
     print(f"→ {args.out}")
-    return 0 if not missing else 1
+    print(usage_line(sheet_client, tr_client))
+    if missing:
+        # 몇 개 빠졌다고 나머지를 통째로 버리면 안 된다. 실측에서 692줄 중 688줄을
+        # 번역해 놓고 4줄 때문에 exit 1 이 나 파이프라인이 멈췄다 — 그 4줄은
+        # 조판이 어차피 건너뛴다(번역 없는 박스는 원문을 그대로 둔다).
+        # 그래서 경고는 크게 내되 진행은 시킨다. 아무것도 못 했을 때만 실패다.
+        print(f"⚠️  번역 누락 {len(missing)}/{len(keys)}개 "
+              f"({100*len(missing)/max(len(keys),1):.1f}%): {missing[:10]}"
+              f"{' …' if len(missing) > 10 else ''}", file=sys.stderr)
+        print("   해당 박스는 원문이 그대로 남습니다.", file=sys.stderr)
+    return 1 if not by_key else 0
 
 
 if __name__ == "__main__":

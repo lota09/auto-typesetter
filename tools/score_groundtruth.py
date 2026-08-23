@@ -139,6 +139,19 @@ def align_by_text(page_boxes, bubbles, min_sim=0.25):
     return pairs, leftover, missing
 
 
+def page_number(pg):
+    """정답의 page 번호에 맞춘다.
+
+    예전에는 `index + 1` 이었다. 표지(00.jpg)를 뺀 7장 글롭으로만 돌리던 시절의
+    가정인데, 표지를 포함해 8장을 돌리면 전 페이지가 한 칸씩 밀려 정답과
+    한 개도 짝이 지어지지 않는다 (실제로 매칭 3% 가 나왔다). 파일명이 페이지
+    번호인 소재(Pepper&Carrot 의 00.jpg…07.jpg)에서는 그 번호를 쓴다.
+    숫자가 아니면 예전 규칙으로 돌아간다.
+    """
+    stem = os.path.splitext(os.path.basename(pg.get("file", "")))[0]
+    return int(stem) if stem.isdigit() else pg["index"] + 1
+
+
 def main():
     p = argparse.ArgumentParser(description="정답 대조 채점")
     p.add_argument("--ours", required=True, help="우리 파이프라인 출력 JSON")
@@ -171,7 +184,7 @@ def main():
     box_over = box_under = 0
 
     for pg in ours["pages"]:
-        pno = pg["index"] + 1                       # 우리는 01.jpg 부터 돌린다
+        pno = page_number(pg)
         bubbles = gt_pages.get(pno)
         if bubbles is None:
             continue

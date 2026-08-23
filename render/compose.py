@@ -35,6 +35,37 @@ from make_mask import mask_for_box  # noqa: E402
 DEFAULT_FONT = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 
 
+# 줄 앞에 혼자 올 수 없는 글자 (닫는 부호·문장부호). 앞줄 끝에 붙여야 한다.
+NO_LINE_START = "…‥。、．，!?！？)]}』」〉》”’·~〜ー・"
+# 줄 끝에 혼자 올 수 없는 글자 (여는 부호).
+NO_LINE_END = "([{『「〈《“‘"
+
+
+def _fix_orphans(lines):
+    """문장부호가 줄 머리에 혼자 오는 것을 앞줄로 당긴다.
+
+    `네 … 네.` 가 `네` / `…` / `네.` 로 쪼개져 나오는 것을 막는다. 조판에서
+    금칙 처리라 부르는 규칙이고, 없으면 부호 한 글자가 줄을 통째로 차지한다.
+    """
+    out = []
+    for ln in lines:
+        if out and ln and ln[0] in NO_LINE_START:
+            # 앞줄로 옮길 수 있는 만큼 당긴다.
+            k = 0
+            while k < len(ln) and ln[k] in NO_LINE_START:
+                k += 1
+            out[-1] += ln[:k]
+            ln = ln[k:].lstrip()
+            if not ln:
+                continue
+        while ln and out and out[-1] and out[-1][-1] in NO_LINE_END:
+            out[-1] = out[-1][:-1]
+            ln = out[-1][-1:] + ln if False else ln
+            break
+        out.append(ln)
+    return [l for l in out if l]
+
+
 def wrap_to_box(draw, text, font, max_w):
     """한국어는 공백 단위로 끊되, 한 낱말이 폭을 넘으면 글자 단위로 쪼갠다."""
     lines, cur = [], ""
@@ -58,7 +89,7 @@ def wrap_to_box(draw, text, font, max_w):
             ln = ln[cut:]
         if ln:
             out.append(ln)
-    return out
+    return _fix_orphans(out)
 
 
 def measured_glyph_px(img, t, mask_fn):
@@ -164,6 +195,139 @@ def fit_text(draw, text, box_w, box_h, font_path, max_size, min_size, line_gap):
     return best
 
 
+def _overlap_ratio(a, b):
+    x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+    x2, y2 = min(a[2], b[2]), min(a[3], b[3])
+    ov = max(0, x2 - x1) * max(0, y2 - y1)
+    small = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    return ov / small if small > 0 else 0.0
+
+
+def separate_neighbours(placements, bboxes, thresh=0.5, gap=2):
+    """이웃한 **다른** 말풍선끼리 확장이 서로를 먹은 것을 떼어 놓는다.
+
+    말풍선 확장은 박스마다 독립적으로 돈다. 말풍선 둘이 맞닿아 있으면 flood fill
+    이 이웃까지 흘러, 원본 박스는 멀쩡히 떨어져 있는데 확장된 자리만 겹친다.
+    실측(ep11 p03): 원본 y 159–341 과 421–600 은 떨어져 있는데 확장 결과가
+    132–544 와 372–616 이 되어 41% 겹쳤고, 두 대사가 한 줄에 포개져 찍혔다.
+
+    `split_shared_rects` 는 겹침 0.5 이상만 본다. 그건 **한 말풍선**을 나눠 받은
+    경우를 위한 것이고, 여기는 애초에 남의 말풍선을 침범한 경우라 다루는 방법도
+    다르다 — 나누는 게 아니라 **경계를 원본 박스 사이 중간에 긋는다.**
+
+    원본 박스는 Magi 가 준 픽셀 정확한 좌표다. 확장이 그것을 넘어설 수는 있어도
+    이웃의 원본을 먹어서는 안 된다. 그래서 항상 원본만큼은 남긴다.
+    """
+    rects = [list(p[0]) for p in placements]
+    for i in range(len(rects)):
+        for j in range(i + 1, len(rects)):
+            ov = _overlap_ratio(rects[i], rects[j])
+            if not 0 < ov < thresh:
+                continue                      # 0.5 이상은 같은 말풍선 취급 → 아래 함수 담당
+            bi, bj = bboxes[i], bboxes[j]
+            if _overlap_ratio(bi, bj) > 0:
+                continue                      # 원본이 겹치면 남남이 아니다
+            v = max(bi[1], bj[1]) - min(bi[3], bj[3])   # 세로로 벌어진 정도
+            h = max(bi[0], bj[0]) - min(bi[2], bj[2])   # 가로로 벌어진 정도
+            if v >= h and v > 0:
+                a, b = (i, j) if bi[1] < bj[1] else (j, i)
+                mid = (bboxes[a][3] + bboxes[b][1]) / 2
+                rects[a][3] = min(rects[a][3], mid - gap)
+                rects[b][1] = max(rects[b][1], mid + gap)
+            elif h > 0:
+                a, b = (i, j) if bi[0] < bj[0] else (j, i)
+                mid = (bboxes[a][2] + bboxes[b][0]) / 2
+                rects[a][2] = min(rects[a][2], mid - gap)
+                rects[b][0] = max(rects[b][0], mid + gap)
+    # 경계는 언제나 두 원본 사이에 있으므로, 원본까지 되돌려도 다시 겹치지 않는다.
+    out = []
+    for (_r, _id, n), r, b in zip(placements, rects, bboxes):
+        r = (min(r[0], b[0]), min(r[1], b[1]), max(r[2], b[2]), max(r[3], b[3]))
+        out.append((tuple(int(round(v)) for v in r), _id, n))
+    return out
+
+
+def merge_shared_bubbles(targets, placements, thresh=0.5):
+    """같은 말풍선을 배정받은 대사들을 **한 문단으로 합쳐** 그린다.
+
+    세로쓰기 원문에서 Magi 는 한 말풍선의 열을 별개 박스로 잡는다. 그런데 그건
+    조판 단위가 아니라 원문의 줄바꿈일 뿐이다 — 대개 한 문장이다. 위아래로
+    나눠 각자 그리면 몫이 좁아져 말풍선을 넓힌 이득이 상쇄되고, 몫이 모자라면
+    넘친다(`감사하겠습니다`가 그랬다).
+
+    합치면 말풍선 전체를 한 문단이 쓴다. 원문이 그 말풍선을 다 쓰고 있었으므로
+    들어갈 자리는 원래 있다.
+
+    돌려주는 것은 (자리, 글, 합쳐진 박스 수) 목록이다.
+    """
+    n = len(placements)
+    used = [False] * n
+    jobs = []
+    for i in range(n):
+        if used[i]:
+            continue
+        group = [i]
+        for j in range(i + 1, n):
+            if not used[j] and _overlap_ratio(placements[i][0], placements[j][0]) >= thresh:
+                group.append(j)
+        for k in group:
+            used[k] = True
+        group.sort(key=lambda k: placements[k][1])   # 원문 읽는 순서 = 박스 id
+        rect = (min(placements[k][0][0] for k in group),
+                min(placements[k][0][1] for k in group),
+                max(placements[k][0][2] for k in group),
+                max(placements[k][0][3] for k in group))
+        text = " ".join(s for s in
+                        ((targets[k].get("target") or "").strip() for k in group) if s)
+        jobs.append((rect, text, len(group)))
+    return jobs
+
+
+def split_shared_rects(placements, thresh=0.5):
+    """같은 말풍선을 배정받은 대사들을 위아래로 나눠 겹치지 않게 한다.
+
+    세로쓰기 원문에서는 Magi 가 한 말풍선의 열을 **별개 박스**로 잡는 일이 있다.
+    그런데 말풍선 검출은 박스마다 따로 도니, 두 박스가 각각 같은 말풍선을 찾아
+    거의 같은 자리를 받는다 (실측 겹침 92%, 99%). 각자 그 한가운데 그리면 글자가
+    포개져 판독 불가가 된다.
+
+    가로쓰기 서양 레이아웃(ep11)에서는 말풍선당 박스가 하나라 드러나지 않았다.
+    말풍선 확장 기능이 만든 회귀다.
+
+    나누는 방향은 위아래다. 한국어는 가로쓰기라 폭을 줄이면 줄바꿈이 망가지지만
+    높이는 나눠도 읽는 순서가 유지된다. 몫은 글자 수에 비례해 준다.
+    """
+    used = [False] * len(placements)
+    for i in range(len(placements)):
+        if used[i]:
+            continue
+        group = [i]
+        for j in range(i + 1, len(placements)):
+            if used[j]:
+                continue
+            if _overlap_ratio(placements[i][0], placements[j][0]) >= thresh:
+                group.append(j)
+        if len(group) == 1:
+            continue
+        for k in group:
+            used[k] = True
+        # 원문 읽는 순서(박스 id)대로 위에서 아래로 배치한다.
+        group.sort(key=lambda k: placements[k][1])
+        x1 = min(placements[k][0][0] for k in group)
+        y1 = min(placements[k][0][1] for k in group)
+        x2 = max(placements[k][0][2] for k in group)
+        y2 = max(placements[k][0][3] for k in group)
+        weights = [max(1, placements[k][2]) for k in group]
+        total = sum(weights)
+        top = y1
+        for k, wgt in zip(group, weights):
+            share = int((y2 - y1) * wgt / total)
+            placements[k] = ((x1, top, x2, min(y2, top + share)),
+                             placements[k][1], placements[k][2])
+            top += share
+    return placements
+
+
 def area_cap(box_w, box_h, text, fill=0.85):
     """이 자리에 이 글자 수를 넣을 때 가능한 최대 글자 크기.
 
@@ -221,6 +385,10 @@ def main():
                    help="자리 넓이를 글자가 채우는 비율. 낮추면 여유롭게 조판된다")
     p.add_argument("--margin", type=float, default=0.06,
                    help="박스 안쪽 여백 비율. 글자가 말풍선 선에 닿지 않게 한다")
+    p.add_argument("--shared-bubble", choices=["merge", "split"], default="merge",
+                   help="한 말풍선을 여러 박스가 나눠 받았을 때. merge=한 문단으로 "
+                        "합쳐 말풍선 전체를 쓴다(기본). split=위아래로 나눠 각자 "
+                        "그린다(옛 동작 — 몫이 좁아져 넘치는 일이 있었다)")
     p.add_argument("--no-bubble", action="store_true",
                    help="말풍선 검출을 끄고 텍스트 박스에 그대로 조판한다")
     p.add_argument("--bubble-tol", type=int, default=18,
@@ -289,15 +457,29 @@ def main():
         draw = ImageDraw.Draw(pil)
         page_base = base_glyph_px([pg], "page") if args.size_scope == "page" else None
         placed = widened = overflow = 0
+        # 자리를 먼저 전부 정하고 겹침을 푼다. 하나씩 그리면서 정하면 뒤에 오는
+        # 대사가 앞 대사 위에 겹쳐 그려진다.
+        placements = []
         for t in targets:
-            # 지우기는 텍스트 박스로, **조판은 말풍선 안쪽 사각형으로** 한다.
-            # 세로쓰기 원문의 길쭉한 박스에 가로쓰기 한국어를 넣으면 한두 글자씩
-            # 끊겨 쌓인다. 말풍선을 찾으면 가로로 자연스럽게 퍼진다.
             if args.no_bubble:
                 rect, used = tuple(int(round(v)) for v in t["bbox"]), False
             else:
                 rect, used = typeset_rect_multi(img, t["bbox"])
             widened += bool(used)
+            placements.append((rect, t.get("id", 0), len((t.get("target") or "").strip())))
+        # 순서가 중요하다. 먼저 남의 말풍선을 침범한 것을 떼어 놓고(그래야 아래
+        # 단계가 남남을 한 말풍선으로 오인하지 않는다), 그다음 진짜로 한 말풍선을
+        # 나눠 받은 것들을 합치거나 나눈다.
+        bboxes = [tuple(float(v) for v in t["bbox"]) for t in targets]
+        placements = separate_neighbours(placements, bboxes)
+        if args.shared_bubble == "merge":
+            jobs = merge_shared_bubbles(targets, placements)
+        else:
+            jobs = [(rect, (t.get("target") or "").strip(), 1)
+                    for t, (rect, _i, _n) in zip(targets, split_shared_rects(placements))]
+        merged = sum(k - 1 for _r, _t, k in jobs)
+
+        for rect, text, _k in jobs:
             x1, y1, x2, y2 = rect
             bw, bh = x2 - x1, y2 - y1
             mx = int(bw * args.margin)
@@ -307,12 +489,12 @@ def main():
             base = chapter_base if args.size_scope == "chapter" else page_base
             if base:
                 font, lines, lh, of = fit_at_base(
-                    draw, t["target"].strip(), iw, ih, args.font,
+                    draw, text, iw, ih, args.font,
                     base * args.size_scale, args.size_fill, args.line_gap,
                     args.max_font, args.min_font)
                 overflow += of
             else:
-                font, lines, lh = fit_text(draw, t["target"].strip(), iw, ih,
+                font, lines, lh = fit_text(draw, text, iw, ih,
                                            args.font, args.max_font, args.min_font,
                                            args.line_gap)
             total_h = len(lines) * lh
@@ -327,7 +509,9 @@ def main():
         stem = os.path.splitext(os.path.basename(pg["file"]))[0]
         dest = os.path.join(args.out_dir, f"{stem}_ko.jpg")
         pil.convert("RGB").save(dest, quality=92)
-        print(f"  p{pno:02d} 번역 {placed}개 (말풍선 {widened}, 넘침 {overflow}) | "
+        print(f"  p{pno:02d} 번역 {len(targets)}개 → 문단 {placed}개"
+              f"{f' (합침 {merged})' if merged else ''} "
+              f"(말풍선 {widened}, 넘침 {overflow}) | "
               f"마스크 {100.0*(mask>0).sum()/(H*W):.2f}% → {dest}")
     return 0
 
