@@ -35,77 +35,95 @@
 
 import argparse
 import os
+import re
+import signal
 import subprocess
 import sys
 import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(ROOT, "vlm"))
+import progress as PROG  # noqa: E402
 MAGI_PY = os.path.join(ROOT, "magi", ".venv", "bin", "python")
 OCR_PY = os.path.join(ROOT, "ocr", ".venv", "bin", "python")
 
 STAGES = ["magi", "read", "merge", "cast", "translate", "validate", "render"]
 
-ROUTER_LOG = os.path.join(ROOT, "logs", "llama-router.log")
-LLAMA_DIR = os.environ.get(
-    "LLAMA_SERVER_DIR", "/home/lota/Developments/llamacpp/llama_server_cuda")
-# pkill 패턴을 통짜 문자열로 두면, 이 파일을 인자로 실행하는 셸의 명령줄에도
-# 그 문자열이 있어서 pkill 이 자기 자신을 죽인다. 실제로 세 번 당했다.
-# 쪼갠 형태를 유지할 것.
-ROUTER_PAT = os.path.basename(LLAMA_DIR) + "/llama-" + "server"
+CONFIG_DIR = os.path.join(ROOT, "config")
+LOG_DIR = os.path.join(ROOT, "logs")
+
+# build_cast.py 는 자체 단계 키가 없고 styleguide 를 빌려 쓴다.
+STAGE_KEY = {"cast": "styleguide"}
 
 
-def router_stop():
-    """라우터를 내려 VRAM 을 비운다.
-
-    32GB MI50 시절에는 Magi 앞에서 이걸 반드시 해야 했다. Magi 는 PyTorch 로
-    GPU 를 직접 쓰는데 llama-server 가 28~30GB 를 쥐고 있으면 2GB 도 못 얻어
-    OOM 으로 죽었다. /models/unload 엔드포인트도, 자식 프로세스만 죽이는 것도
-    VRAM 을 반환하지 않아서 프로세스를 내리는 방식으로 갔다.
-
-    64GB 로 바뀐 뒤로는 기본값이 아니다 (--stop-router-for-magi 참조).
-    """
-    subprocess.run(["pkill", "-f", ROUTER_PAT], stderr=subprocess.DEVNULL)
-    time.sleep(5)
+def load_cfg():
+    import json as _json
+    return _json.load(open(os.path.join(CONFIG_DIR, "config.json"), encoding="utf-8"))
 
 
-def router_alive(timeout=3):
+# ── 백엔드 ───────────────────────────────────────────────────────────────
+#
+# 파이프라인은 **아무 서버도 띄우지 않는다.** 로컬 vLLM 이든 llama.cpp 든 원격
+# API 든 전부 같은 것으로 본다 — OpenAI 호환 주소 하나. 기동은 사용자 책임이다.
+#
+# 시작할 때 한 번만 확인하고, 안 되더라도 **경고만 하고 진행한다.** ① Magi 는
+# LLM 이 없어도 돌고, 그동안 사용자가 서버를 띄울 수 있다. 정말 필요한 단계에서
+# 못 쓰면 그때 그 단계가 실패한다 — 그게 정확한 시점이다.
+
+ROLE_OF_STAGE = {"read_page": "read", "read_texts": "read",
+                 "styleguide": "translate", "translate": "translate",
+                 "repair": "translate", "judge": "translate"}
+
+
+def role_spec(cfg, role, model_read=None, model_text=None):
+    """역할 설정 + CLI 덮어쓰기."""
+    spec = dict(cfg.get(role) or {})
+    over = model_read if role == "read" else model_text
+    if over:
+        spec["model"] = over
+    return spec
+
+
+def probe_role(cfg, role, spec, timeout=5):
+    """이 역할의 주소가 그 모델을 내놓는가. (상태문구, 정상여부)."""
+    import json as _json
     import urllib.request
+    url = (spec.get("base_url") or "").rstrip("/")
+    if not url:
+        return f"{role}: base_url 이 없습니다", False
+    want = spec.get("model")
+    if not want:
+        return f"{role}: model 이 없습니다", False
+    env = spec.get("api_key_env")
+    if env and not os.environ.get(env):
+        return f"{role}: 환경변수 {env} 가 비어 있습니다", False
+    req = urllib.request.Request(url + "/models")
+    if env:
+        req.add_header("Authorization", f"Bearer {os.environ[env]}")
     try:
-        urllib.request.urlopen("http://127.0.0.1:8081/v1/models", timeout=timeout)
-        return True
-    except Exception:
-        return False
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            cards = _json.loads(r.read()).get("data") or []
+    except Exception as e:
+        return f"{role}: {url} 에 닿지 못했습니다 ({type(e).__name__})", False
+    card = next((c for c in cards if c.get("id") == want), None)
+    if card is None:
+        have = ", ".join(sorted(c.get("id", "?") for c in cards)[:3]) or "(없음)"
+        return f"{role}: '{want}' 을 내놓지 않습니다 — 지금 있는 것: {have}", False
+    ctx = card.get("max_model_len")
+    return f"{role}: {want}{f' · ctx {ctx}' if ctx else ''}", True
 
 
-def router_start(timeout=180):
-    """라우터를 띄우고 응답할 때까지 기다린다.
-
-    이미 떠 있으면 그대로 쓴다. 확인 없이 또 띄우면 8081 바인드에 실패한
-    좀비가 하나 더 생기는데, 아래 대기 루프는 **먼저 떠 있던** 쪽의 응답을
-    보고 성공으로 판정해 버려서 실패가 조용히 묻힌다.
-    """
-    if router_alive():
-        print("   라우터가 이미 떠 있습니다 — 그대로 사용")
-        return True
-    import urllib.request
-    env = dict(os.environ)
-    env["LD_LIBRARY_PATH"] = LLAMA_DIR + ":" + env.get("LD_LIBRARY_PATH", "")
-    os.makedirs(os.path.dirname(ROUTER_LOG), exist_ok=True)
-    with open(ROUTER_LOG, "w") as log:
-        subprocess.Popen(
-            [os.path.join(LLAMA_DIR, "llama-server"),
-             "--models-preset", os.path.join(ROOT, "config", "models.ini"),
-             "--models-max", "1", "--models-autoload",
-             "--host", "127.0.0.1", "--port", "8081"],
-            stdout=log, stderr=log, env=env, start_new_session=True)
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        try:
-            urllib.request.urlopen("http://127.0.0.1:8081/v1/models", timeout=3)
-            return True
-        except Exception:
-            time.sleep(2)
-    return False
+def health_banner(cfg, model_read=None, model_text=None):
+    """시작 배너. 문제가 있어도 **막지 않는다** — 경고만 남기고 진행한다."""
+    ok_all = True
+    for role in ("read", "translate"):
+        line, ok = probe_role(cfg, role, role_spec(cfg, role, model_read, model_text))
+        print(f"── {line}" if ok else f"── 경고 {line}", file=sys.stderr if not ok else sys.stdout)
+        ok_all &= ok
+    if not ok_all:
+        print("   LLM 이 필요한 단계에서 실패합니다. 그 전에 서버를 띄우면 이어집니다.",
+              file=sys.stderr)
+    return ok_all
 
 
 def is_fresh(out_path, *inputs):
@@ -120,36 +138,32 @@ def is_fresh(out_path, *inputs):
     return all(not os.path.exists(i) or os.path.getmtime(i) <= t for i in inputs)
 
 
-def detected_langs(page_json):
-    """판독 패스가 본 원문 언어의 페이지 분포.
+def page_langs(page_json):
+    """쪽별 원어. read_page 가 채운 전사를 코드가 세서 정한다.
 
-    manga-ocr 은 일본어 전용인데 다른 언어에서 **빈 출력이 아니라 그럴듯하게 틀린
-    글**을 낸다(번체 중국어에 돌리니 `眞的狼危険` 처럼 한자를 일본 자형으로 바꿔
-    내놓았다). 그래서 뒤에서 검사로 걸러지지 않는다 — 전사를 시작하기 전에
-    막는 수밖에 없다.
-
-    최빈값이 아니라 **분포**를 돌려주는 이유: 한 챕터가 섞여 있을 수 있다.
-    실측 maid2 는 일본어 49페이지 / 중국어 24페이지였고, 다수결로 고르면
-    중국어 24페이지가 조용히 망가진다. 한 페이지라도 일본어가 아니면 안 쓴다.
+    모델에게 `lang` 을 묻던 것을 버린 이유: 같은 페이지 안에서 자기와 불일치했다.
+    한자만 든 박스는 글자만으로 일본어·중국어가 갈리지 않기 때문이다. 쪽 단위는
+    근거가 쌓여 안정적이다 — 일본어 한 쪽에는 거의 반드시 가나가 나온다.
     """
     import json as _json
-    from collections import Counter
+    sys.path.insert(0, os.path.join(ROOT, "vlm"))
+    import language as LANG
     try:
         d = _json.load(open(page_json, encoding="utf-8"))
     except Exception:
-        return Counter()
-    return Counter(pg.get("source_lang") for pg in d.get("pages", [])
-                   if pg.get("source_lang"))
+        return {}, {}
+    chapter, _ = LANG.chapter_language(d)
+    return LANG.page_languages(d, chapter)
 
 
 def run(cmd, label):
-    print(f"\n── {label}", flush=True)
+    PROG.log(f"\n── {label}")
     t = time.time()
     r = subprocess.run(cmd)
     if r.returncode != 0:
-        print(f"   실패 (exit {r.returncode})", file=sys.stderr)
+        PROG.log(f"   실패 (exit {r.returncode})")
         return False
-    print(f"   {time.time()-t:.1f}초", flush=True)
+    PROG.log(f"   {time.time()-t:.1f}초")
     return True
 
 
@@ -202,6 +216,7 @@ def main():
                         "크롭·인코딩·HTTP 를 GPU 작업과 겹치는 데서 온다 — "
                         "서버(models.ini)의 parallel 은 올릴 필요가 없다. "
                         "자세한 것은 docs/PARALLELISM.md")
+    p.add_argument("--model", help="판독·번역 양쪽을 이 모델 id 로")
     p.add_argument("--model-read", help="판독 두 단계(read_page/read_texts)의 모델을 강제한다")
     p.add_argument("--model-text",
                    help="텍스트 단계(cast/시트/번역/수정)의 모델을 강제한다")
@@ -209,15 +224,25 @@ def main():
                    help="처리에서 뺄 페이지(1-base). 후원자 명단·판권지 등")
     p.add_argument("--no-resume", dest="resume", action="store_false",
                    help="이미 끝난 단계도 다시 돌린다")
-    p.add_argument("--no-manage-router", dest="manage_router", action="store_false",
-                   help="라우터를 직접 띄우고 내리지 않는다 (직접 관리할 때)")
-    p.add_argument("--stop-router-for-magi", action="store_true",
-                   help="Magi 전에 라우터를 내려 VRAM 을 비운다. 32GB 시절에는 "
-                        "필수였다. 64GB(CMP 170HX)에서는 판독 모델 43.5GB 를 "
-                        "얹은 채로 Magi 가 정상 동작하는 것을 확인했으므로 기본 꺼짐")
     p.add_argument("--from-stage", choices=STAGES, default="magi")
     p.add_argument("--only", choices=STAGES, help="이 단계만 돌린다")
     args = p.parse_args()
+
+    cfg = load_cfg()
+
+    # --model 은 판독·텍스트 양쪽을 한 번에 정한다. vLLM 은 프로세스당 모델이
+    # 하나라 이게 정상 사용법이고, 나누고 싶으면 --model-read/--model-text 가 이긴다.
+    args.model_read = args.model_read or args.model
+    args.model_text = args.model_text or args.model
+
+    def alias_for(stage):
+        role = ROLE_OF_STAGE.get(STAGE_KEY.get(stage, stage), "translate")
+        return role_spec(cfg, role, args.model_read, args.model_text).get("model")
+
+    def need(stage):
+        """예전에는 여기서 서버를 맞췄다. 지금은 아무것도 하지 않는다 —
+        확인은 시작할 때 한 번 했고, 못 쓰면 그 단계가 스스로 실패한다."""
+        return True
 
     transcribe_explicit = args.transcribe is not None
     if args.transcribe is None:
@@ -228,22 +253,25 @@ def main():
 
     w = args.work
     os.makedirs(w, exist_ok=True)
+    # 중간 산출물 옆에 전체 기록을 남긴다. 터미널은 짧게 유지하고(반복되는 진행
+    # 줄은 한 자리에서 갱신), 파일에는 한 줄도 빠뜨리지 않는다.
+    log_path = os.path.join(w, "run.log")
+    PROG.open_log(log_path)
+    PROG.log(f"\n{'='*66}\n{time.strftime('%Y-%m-%d %H:%M:%S')}  "
+             f"{' '.join(sys.argv)}\n{'='*66}")
+    health_banner(cfg, args.model_read, args.model_text)
     out_dir = args.out or os.path.join(w, "out")
     sg = args.styleguide or os.path.join(w, "styleguide.json")
     f = lambda n: os.path.join(w, n)
     think = lambda stage: thinking_flags(stage, args.thinking)
-    model_read = ["--model", args.model_read] if args.model_read else []
     workers = ["--workers", str(args.workers)]
-    model_text = ["--model", args.model_text] if args.model_text else []
+
 
     start = 0 if args.only else STAGES.index(args.from_stage)
     todo = [args.only] if args.only else STAGES[start:]
 
     if "magi" in todo and not (args.resume and is_fresh(f("magi.json"))):
-        if args.manage_router and args.stop_router_for_magi:
-            print("── 라우터 정지 (Magi 가 VRAM 을 써야 한다)")
-            router_stop()
-        if not run([MAGI_PY, os.path.join(ROOT, "magi", "magi_worker.py"),
+        if not run([MAGI_PY, os.path.join(ROOT, "magi", "magi_worker.py"), "--log", log_path,
                     "--pages", args.pages, "--out", f("magi.json"),
                     "--batch-size", "10", "--no-ocr"], "① Magi 기하학"):
             return 1
@@ -258,97 +286,113 @@ def main():
                        ensure_ascii=False, indent=1)
             print(f"   제외 적용: 페이지 {before} → {len(d['pages'])} {args.skip_pages}")
 
-    if args.manage_router and set(todo) & {"read", "cast", "translate", "validate"}:
-        print("── 라우터 기동")
-        if not router_start():
-            print("   라우터가 응답하지 않습니다", file=sys.stderr)
-            return 1
 
     if "read" in todo:
-        if not run([MAGI_PY, os.path.join(ROOT, "vlm", "read_page.py"),
+        if not need("read_page"):
+            return 1
+        if not run([MAGI_PY, os.path.join(ROOT, "vlm", "read_page.py"), "--log", log_path,
                     "--magi-json", f("magi.json"), "--out", f("page.json"),
-                    "--no-cast-memory"] + model_read + workers + think("read_page")
+                    "--no-cast-memory", "--model", alias_for("read_page")]
+                   + workers + think("read_page")
                    + ([] if args.resume else ["--no-resume"]),
                    "② 페이지 판독 (화자·언어)"):
             return 1
-        if args.transcribe == "ocr":
-            langs = detected_langs(f("page.json"))
-            other = {k: v for k, v in langs.items() if k != "ja"}
-            if other:
-                mix = ", ".join(f"{k} {v}장" for k, v in sorted(langs.items()))
-                msg = (f"   판독이 일본어가 아닌 페이지를 봤습니다 ({mix}). "
-                       "manga-ocr 은 일본어 전용이고 다른 언어에서는 빈 출력이 아니라 "
-                       "**그럴듯하게 틀린 글**을 내놓아 검사로 걸러지지 않습니다")
-                if transcribe_explicit:
-                    print("경고: " + msg + " — ocr 을 명시했으므로 그대로 진행합니다",
-                          file=sys.stderr)
-                else:
-                    print(msg + "\n   → 크롭 전사를 vlm 으로 돌립니다 "
-                          "(강행하려면 --transcribe ocr)")
-                    args.transcribe = "vlm"
+        # ── 전사 라우팅 ────────────────────────────────────────────────
+        #
+        # 쪽마다 맞는 모델로 보낸다. 규칙으로 결과를 고치려 하지 않는다.
+        #
+        # 근거(실측, maid2 9쪽 일본어): 판독 VLM 이 손글씨를 숫자로 읽었다 —
+        #   できたよ、       → 1124.146
+        #   ありがとうございます → 16=4×2人いわつ16か
+        # 같은 크롭을 manga-ocr 에 주면 **둘 다 정확히** 읽는다. 전사는 모델의
+        # 능력 문제이고, 파이프라인이 할 수 있는 일은 **맞는 모델로 보내는 것**이다.
+        #
+        # manga-ocr 은 일본어 전용이라 다른 언어에서는 빈 출력이 아니라 그럴듯하게
+        # 틀린 글을 낸다. 그래서 **일본어로 판정된 쪽에만** 쓴다.
+        per, dist = page_langs(f("page.json"))
+        ja_pages = sorted(i + 1 for i, l in per.items() if l == "ja")
+        if dist:
+            PROG.log(f"   쪽 원어 {dist}")
 
-        if args.transcribe == "ocr":
-            # manga_ocr_pass 에는 --fill-from 이 없다. 부분 재개가 불가능하므로
-            # 이미 신선한 crop.json 이 있으면 아예 부르지 않는다. 그냥 부르면
-            # 멀쩡한 전사를 통째로 덮어쓴다 — VLM 으로 읽어 둔 것이었다면 손해다.
-            if args.resume and is_fresh(f("crop.json"), f("magi.json")):
-                print("── ② 크롭 전사 [manga-ocr] — 이미 있는 crop.json 을 씁니다")
+        use_ocr = args.transcribe == "ocr" and ja_pages
+        if args.transcribe == "ocr" and not ja_pages:
+            PROG.log("   일본어로 판정된 쪽이 없습니다 — 전사를 vlm 으로 돌립니다")
+            args.transcribe = "vlm"
+
+        if use_ocr:
+            # 일본어 쪽만 manga-ocr 로 채운다. 나머지는 비워 두고 VLM 이 맡는다.
+            other = [i + 1 for i, l in per.items() if l != "ja"]
+            if other:
+                PROG.log(f"   manga-ocr 로 일본어 {len(ja_pages)}쪽, "
+                         f"VLM 으로 나머지 {len(other)}쪽")
+            if args.resume and is_fresh(f("crop.json"), f("page.json")):
+                PROG.log("── ② 크롭 전사 [manga-ocr] — 이미 있는 crop.json 을 씁니다")
             elif not run([OCR_PY, os.path.join(ROOT, "ocr", "manga_ocr_pass.py"),
-                          "--magi-json", f("magi.json"), "--out", f("crop.json")],
-                         "② 크롭 전사 [manga-ocr]"):
+                          "--magi-json", f("page.json"), "--out", f("crop.json"),
+                          "--pages"] + [str(n) for n in ja_pages],
+                         "② 크롭 전사 [manga-ocr · 일본어 쪽]"):
                 return 1
-        else:
-            # 크롭 전사는 이 파이프라인에서 가장 비싼 축이다 (박스당 2.2초 ×
-            # 692박스 ≈ 25분). read_page 는 스스로 재개하는데 여기는 그게 없어서,
-            # 뒷단계가 죽어 다시 돌리면 이미 읽은 박스를 통째로 다시 읽었다.
-            #
-            # read_texts 에 이미 --fill-from 이 있다 — 주어진 JSON 에서 채워진
-            # 박스는 옮겨 오고 **빈 것만** 모델에 묻는다. 그게 곧 재개다.
-            # magi.json 보다 새로울 때만 쓴다. 박스가 다시 잡혔는데 옛 전사를
-            # 끌어오면 좌표와 글이 어긋난다.
+
+        # manga-ocr 이 못 맡은 쪽(일본어가 아닌 쪽)과, ocr 을 아예 안 쓴 경우를
+        # VLM 이 맡는다. read_texts 의 --fill-from 이 **이미 채워진 박스는 옮기고
+        # 빈 것만** 모델에 묻는다 — 그게 곧 두 모델을 한 파일에 합치는 방법이다.
+        vlm_needed = (args.transcribe == "vlm"
+                      or (use_ocr and any(l != "ja" for l in per.values())))
+        if vlm_needed:
             fill = (["--fill-from", f("crop.json")]
-                    if args.resume and is_fresh(f("crop.json"), f("magi.json"))
+                    if use_ocr or (args.resume
+                                   and is_fresh(f("crop.json"), f("page.json")))
                     else [])
-            if fill:
-                print("   이미 전사된 crop.json 이 있습니다 — 빈 박스만 읽습니다")
-            if not run([MAGI_PY, os.path.join(ROOT, "vlm", "read_texts.py"),
-                        "--magi-json", f("magi.json"), "--out", f("crop.json")]
-                       + fill + model_read + workers + think("read_texts"),
+            if fill and not use_ocr:
+                PROG.log("   이미 전사된 crop.json 이 있습니다 — 빈 박스만 읽습니다")
+            if not need("read_texts"):
+                return 1
+            if not run([MAGI_PY, os.path.join(ROOT, "vlm", "read_texts.py"), "--log", log_path,
+                        "--magi-json", f("page.json"), "--out", f("crop.json"),
+                        "--model", alias_for("read_texts")]
+                       + fill + workers + think("read_texts"),
                        "② 크롭 전사 [VLM]"):
                 return 1
 
     if "merge" in todo and not (args.resume and is_fresh(f("merged.json"), f("crop.json"), f("page.json"))):
-        if not run([MAGI_PY, os.path.join(ROOT, "vlm", "merge_reads.py"),
+        if not run([MAGI_PY, os.path.join(ROOT, "vlm", "merge_reads.py"), "--log", log_path,
                     "--crop-json", f("crop.json"), "--page-json", f("page.json"),
                     "--out", f("merged.json"), "--prefer", "crop"], "③ 병합"):
             return 1
 
     if "cast" in todo and not (args.resume and is_fresh(f("cast.json"), f("merged.json"))):
-        if not run([MAGI_PY, os.path.join(ROOT, "vlm", "build_cast.py"),
-                    "--read-json", f("merged.json"), "--out", f("cast.json")]
-                   + model_text + think("cast"),
+        if not need("cast"):
+            return 1
+        if not run([MAGI_PY, os.path.join(ROOT, "vlm", "build_cast.py"), "--log", log_path,
+                    "--read-json", f("merged.json"), "--out", f("cast.json"),
+                    "--model", alias_for("cast")] + think("cast"),
                    "④ 인물·스토리"):
             return 1
 
     if "translate" in todo and not (args.resume and is_fresh(f("translated.json"), f("cast.json"))):
         # 시트와 번역은 모델을 따로 지정할 수 있다. 파이프라인에서는 한 값으로 묶는다.
-        tr_model = (["--sheet-model", args.model_text, "--translate-model", args.model_text]
-                    if args.model_text else [])
-        if not run([MAGI_PY, os.path.join(ROOT, "vlm", "translate_chapter.py"),
+        if not need("styleguide"):
+            return 1
+        tr_model = ["--sheet-model", alias_for("styleguide"),
+                    "--translate-model", alias_for("translate")]
+        if not run([MAGI_PY, os.path.join(ROOT, "vlm", "translate_chapter.py"), "--log", log_path,
                     "--page-json", f("cast.json"), "--out", f("translated.json"),
                     "--styleguide", sg] + tr_model
                    + think("styleguide") + think("translate"), "⑤ 시트 + 번역"):
             return 1
 
     if "validate" in todo and not (args.resume and is_fresh(f("final.json"), f("translated.json"))):
-        if not run([MAGI_PY, os.path.join(ROOT, "vlm", "validate_translation.py"),
+        if not need("repair"):
+            return 1
+        if not run([MAGI_PY, os.path.join(ROOT, "vlm", "validate_translation.py"), "--log", log_path,
                     "--translated-json", f("translated.json"), "--styleguide", sg,
-                    "--out", f("final.json"), "--repair"] + model_text + think("repair"),
+                    "--out", f("final.json"), "--repair",
+                    "--model", alias_for("repair")] + think("repair"),
                    "⑥ 검사·자동수정"):
             return 1
 
     if "render" in todo:
-        if not run([MAGI_PY, os.path.join(ROOT, "render", "compose.py"),
+        if not run([MAGI_PY, os.path.join(ROOT, "render", "compose.py"), "--log", log_path,
                     "--translated-json", f("final.json"), "--out-dir", out_dir],
                    "⑦⑧⑨ 마스크·인페인팅·조판"):
             return 1

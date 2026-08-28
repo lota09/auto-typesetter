@@ -20,6 +20,10 @@ import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import progress as PROG  # noqa: E402
+import language as LANG  # noqa: E402
+
 HAN = re.compile(r"[㐀-䶿一-鿿]")
 KANA = re.compile(r"[぀-ヿ]")
 
@@ -44,6 +48,8 @@ def pick(crop_text, page_text, lang, prefer):
 
 def main():
     p = argparse.ArgumentParser(description="크롭 판독과 페이지 판독 병합")
+    p.add_argument("--log", help="이 경로에 전체 로그를 덧붙인다 "
+                   "(터미널은 짧게, 파일은 빠짐없이)")
     p.add_argument("--crop-json", required=True, help="read_texts.py 출력")
     p.add_argument("--page-json", required=True, help="read_page.py 출력")
     p.add_argument("--out", required=True)
@@ -51,6 +57,7 @@ def main():
                    help="본문으로 쓸 판독 (기본 auto: 중국어는 크롭, 그 외 페이지)")
     args = p.parse_args()
 
+    PROG.open_log(getattr(args, 'log', None))
     crop = json.load(open(args.crop_json, encoding="utf-8"))
     doc = json.load(open(args.page_json, encoding="utf-8"))
 
@@ -85,6 +92,34 @@ def main():
                 disagree += 1
             else:
                 t.pop("disagree", None)
+
+    # ── 원어 확정 ───────────────────────────────────────────────────────
+    #
+    # 박스별 lang 투표를 버리고 **쪽 단위 코드포인트**로 정한다. 박스 하나는
+    # 한자만 있을 수 있어 모델 판정이 자기모순을 냈지만, 한 쪽에는 근거가 쌓인다.
+    #
+    # 챕터 하나로 못박지 않는 이유: 실제로 섞인 자료가 있다. maid2 는 한
+    # 디렉터리에 일본어 61쪽 · 중국어 12쪽이 들어 있었다. 챕터를 ja 로 정하면
+    # 그 12쪽의 말투 판정에 일본어 규칙이 걸려 증거가 통째로 사라진다.
+    chapter_lang, ev = LANG.chapter_language(doc)
+    per, dist = LANG.page_languages(doc, chapter_lang)
+    doc["chapter_lang"], doc["chapter_lang_evidence"] = chapter_lang, ev
+    doc["page_langs"] = dist
+    for pg in doc["pages"]:
+        pl = per.get(pg["index"]) or chapter_lang
+        pg["source_lang"] = pl
+        for t in pg["texts"]:
+            t["lang"] = pl
+    bad = LANG.scan(doc, chapter_lang)
+    print(f"원어 {chapter_lang} — 쪽 분포 {dist} "
+          f"(가나 {ev['kana']} · 한글 {ev['hangul']} · 한자 {ev['han']})")
+    if len(dist) > 1:
+        print("경고: 한 작업 디렉터리에 원어가 여러 개입니다 — 작품이 섞여 있을 "
+              "수 있습니다. 말투 규칙은 쪽마다 그 쪽 언어를 씁니다", file=sys.stderr)
+    if bad:
+        print(f"경고: 전사가 글이 아닌 것으로 보이는 박스 {len(bad)}개 "
+              f"(예: {bad[0][2]})", file=sys.stderr)
+    doc["transcription_suspect"] = len(bad)
 
     doc["merge"] = {"prefer": args.prefer,
                     "crop_json": os.path.abspath(args.crop_json),

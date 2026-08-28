@@ -109,6 +109,7 @@ def build_page_record(index, path, size, result):
 
 def main():
     p = argparse.ArgumentParser(description="Magiv2 챕터 분석")
+    p.add_argument("--log", help="이 경로에 전체 로그를 덧붙인다")
     p.add_argument("--pages", nargs="+", required=True,
                    help="페이지 경로 또는 glob. 읽는 순서대로 준다")
     p.add_argument("--out", required=True, help="결과 JSON 경로")
@@ -126,6 +127,9 @@ def main():
                         "받지 않아서 내부 메서드를 감싸 주입한다")
     args = p.parse_args()
 
+    import sys as _s, os as _o
+    _s.path.insert(0, _o.path.join(_o.path.dirname(_o.path.dirname(_o.path.abspath(__file__))), 'vlm'))
+    import progress as _P; _P.open_log(getattr(args, 'log', None))
     pages = []
     for spec in args.pages:
         hits = sorted(glob.glob(spec)) if any(c in spec for c in "*?[") else [spec]

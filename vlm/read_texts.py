@@ -34,6 +34,8 @@ from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import language as LANG  # noqa: E402
+import progress as PROG  # noqa: E402
 from backend import client_for, usage_line  # noqa: E402
 
 # 프롬프트를 영어로 쓴다. 한국어로 지시했더니 출력이 한국어 문자로 끌려갔다
@@ -61,6 +63,8 @@ PROMPT_TEMPLATE = (
 # 특정 작품에 맞춘 기본값을 두지 않는다. maid2 로 실험할 때 "번체 중국어 세로쓰기"
 # 로 못박아 뒀는데, 소재가 바뀌면 그 힌트가 오히려 오답을 유도한다. 언어를 지정
 # 하지 말고 세로쓰기 가능성만 알려주는 것이 여러 작품에 안전하다.
+# 변환된 전사를 다시 부를 때 쓰는 힌트. 챕터 언어를 **못박아** 준다 — 기본 힌트가
+# "언어를 가정하지 말라" 이므로, 변환이 일어난 뒤에는 반대로 지정해 줘야 한다.
 DEFAULT_SCRIPT_HINT = ("The source may be Japanese, Chinese, Korean or English, "
                        "and may be written vertically. Detect it from the image; "
                        "do not assume a language.")
@@ -125,6 +129,8 @@ def main():
     p = argparse.ArgumentParser(description="Magi 박스를 VLM 으로 전사")
     p.add_argument("--magi-json", required=True, help="magi_worker.py 출력")
     p.add_argument("--out", required=True, help="ocr 을 채운 JSON 경로")
+    p.add_argument("--log", help="이 경로에 전체 로그를 덧붙인다 "
+                   "(터미널은 짧게, 파일은 빠짐없이)")
     p.add_argument("--config")
     p.add_argument("--model", help="stages 설정을 무시하고 이 모델을 쓴다")
     p.add_argument("--pad", type=float, default=0.15,
@@ -157,6 +163,7 @@ def main():
                         "인코딩·HTTP 를 GPU 작업과 겹치는 데서 온다")
     args = p.parse_args()
 
+    PROG.open_log(getattr(args, 'log', None))
     doc = json.load(open(args.magi_json, encoding="utf-8"))
     client = client_for("read_texts", args.config, args.model)
     if not client.health():
@@ -241,8 +248,7 @@ def main():
             with tally_lock:
                 fail += 1
             with out_lock:
-                print(f"  [{i}/{len(jobs)}] p{page['index']+1} t{t['id']} 실패: {e}",
-                      flush=True)
+                PROG.log(f"  [{i}/{len(jobs)}] p{page['index']+1} t{t['id']} 실패: {e}")
             return
 
         if raw == "EMPTY" or not raw:
@@ -256,8 +262,8 @@ def main():
                 ok += 1
             shown = t["ocr"]
         with out_lock:
-            print(f"  [{i}/{len(jobs)}] p{page['index']+1} t{t['id']} "
-                  f"{'대사' if t['essential'] else '기타'} | {shown[:60]}", flush=True)
+            PROG.step(f"  [{i}/{len(jobs)}] p{page['index']+1} t{t['id']} "
+                      f"{'대사' if t['essential'] else '기타'} | {shown[:60]}")
 
     # 박스끼리 완전히 독립이라 동시에 던질 수 있다. 결과는 각자의 t 에 직접
     # 쓰이므로 완료 순서는 상관없다 — 로그 순서만 섞인다.
@@ -266,6 +272,8 @@ def main():
     # (config/models.ini 의 parallel). 한쪽만 바꾸면 효과가 0 이다:
     # 슬롯이 4개여도 클라이언트가 하나씩 보내면 3개는 계속 빈다.
     # 근거와 측정 계획은 docs/PARALLELISM.md.
+    PROG.prompt_block("② 크롭 전사", prompt)
+
     numbered = list(enumerate(jobs, 1))
     if args.workers > 1:
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
@@ -273,6 +281,17 @@ def main():
     else:
         for job in numbered:
             transcribe(job)
+
+    PROG.done()
+
+    # 전사 품질은 **모델의 능력**이고, 같은 모델에 다시 물어도 같은 답이 온다
+    # (실측: 손글씨를 숫자로 읽은 박스를 재전사했더니 그대로였다). 그래서 여기서
+    # 고치려 하지 않는다 — 파이프라인이 할 수 있는 일은 **맞는 모델로 보내는 것**
+    # 이고, 그 라우팅은 pipeline.py 가 쪽 언어를 보고 한다.
+    #
+    # 여기서는 쪽 언어만 기록해 둔다. 판정은 ③ 병합이 확정한다.
+    lang, ev = LANG.chapter_language(doc)
+    doc["chapter_lang"], doc["chapter_lang_evidence"] = lang, ev
 
     doc["read_pass"] = {
         "model": client.name, "pad": args.pad,
@@ -285,8 +304,9 @@ def main():
         json.dump(doc, fh, ensure_ascii=False, indent=1)
 
     dt = time.time() - t0
-    print(f"\n전사 {ok}개 / 빈 박스 {empty}개 / 실패 {fail}개  "
-          f"({dt:.1f}초, {dt/len(jobs):.1f}초/개) → {args.out}")
+    PROG.done()
+    PROG.log(f"\n전사 {ok}개 / 빈 박스 {empty}개 / 실패 {fail}개  "
+             f"({dt:.1f}초, {dt/len(jobs):.1f}초/개) → {args.out}")
     print(usage_line(client))
     return 0 if fail == 0 else 1
 

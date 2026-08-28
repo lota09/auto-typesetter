@@ -3,7 +3,10 @@
 만화를 **한국어로 자동 역식**한다 — 대사를 읽고, 누가 말했는지 정하고, 번역하고,
 원문을 지운 자리에 다시 얹는다. 사람이 승인하는 단계는 없다.
 
-로컬 GPU 한 장에서 돈다. 외부 API 를 쓰지 않는다.
+**LLM 백엔드는 갈아 끼울 수 있다.** 로컬 GPU 한 장(vLLM·llama.cpp)으로도, 원격
+API(OpenAI·OpenRouter)로도 돈다 — 코드에 로컬 분기가 없고 전부 OpenAI 호환 주소
+하나로 본다. 다만 **LLM 서버는 이 도구가 띄우지 않는다**(로컬이라면 직접 기동).
+말풍선 기하(Magi)와 선택적 일본어 OCR 은 언제나 로컬 GPU 에서 돈다.
 
 ---
 
@@ -55,9 +58,10 @@ Magi(magiv2)가 VLM 으로 대체 불가능한 것은 **픽셀 정확한 좌표*
 
 | | |
 |---|---|
-| GPU | VRAM 20GB 이상 (판독 모델을 Q8 로 쓰면 48GB). 개발·측정은 NVIDIA CMP 170HX 64GB |
-| LLM 백엔드 | llama.cpp 서버 (라우터 모드). OpenAI 호환 `/v1/chat/completions` 면 무엇이든 |
-| 모델 | 비전 VLM 1개(판독) + 텍스트 LLM 1개(번역). `config/models.ini` 참조 |
+| GPU | ① Magi 기하 단계용. 없으면 실용적이지 않다. 개발·측정은 NVIDIA CMP 170HX 64GB |
+| LLM 백엔드 | **OpenAI 호환 `/v1` 주소 하나.** 로컬(vLLM·llama.cpp)이든 원격(OpenAI·OpenRouter)이든 상관없다 |
+| 모델 | 비전이 되는 모델 1개면 전 단계를 감당한다. 나누고 싶으면 판독용·텍스트용 2개 |
+| VRAM | **로컬 백엔드를 쓸 때만.** 27B 모델 기준 18~30GB + Magi 몫 |
 | 폰트 | `/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc` (`--font` 으로 교체 가능) |
 
 ### 가상환경 두 개
@@ -84,8 +88,38 @@ ocr/.venv/bin/pip install "transformers==4.46.3" manga-ocr
 
 ### 모델 설정
 
-`config/models.ini` 가 llama-server 라우터 프리셋이고, `config/config.json` 이
-단계별 모델 배치다. **둘은 별개 파일이라 한쪽만 고치면 조용히 어긋난다.**
+### ★ 이 파이프라인은 LLM 서버를 띄우지 않는다
+
+로컬이든 원격이든 **OpenAI 호환 주소 하나로만** 본다. 코드에 로컬 분기가 없고,
+로컬 백엔드의 기동·종료는 사용자 몫이다.
+
+`config/config.json` 은 **역할 둘**이 전부다:
+
+```json
+{
+  "read":      { "base_url": "http://127.0.0.1:8000/v1", "api_key_env": null, "model": "..." },
+  "translate": { "base_url": "https://openrouter.ai/api/v1", "api_key_env": "OPENROUTER_API_KEY", "model": "..." }
+}
+```
+
+`read` 는 ② 페이지 판독·크롭 전사(이미지를 본다), `translate` 는 ④⑤⑥ 인물·시트·
+번역·검사다. 같은 값을 두 번 적으면 한 모델이 전 단계를 맡고, 다르게 적으면 갈린다 —
+서버가 달라도, 한쪽이 원격 API 여도 상관없다.
+
+나머지는 전부 선택이고 기본값이 있다: `thinking_style`(기본 `llama_cpp`) ·
+`supports_json_schema`(true) · `timeout`(1800) · `vision`(true) · `max_image_pixels`(없음).
+
+**시작할 때 한 번 확인하지만 막지는 않는다.** 서버가 없으면 경고만 내고 ① Magi 를
+돌린다 — 그동안 서버를 띄우면 이어진다. 정말 필요한 단계에서 못 쓰면 그때 실패한다.
+
+```
+── read: orcarouter_Qwen3.8-27B_AL_NVFP4-FP8 · ctx 32768
+── 경고 translate: http://127.0.0.1:8000/v1 에 닿지 못했습니다 (URLError)
+   LLM 이 필요한 단계에서 실패합니다. 그 전에 서버를 띄우면 이어집니다.
+```
+
+`config/models.ini` 는 llama-server 라우터를 **직접 띄울 때 쓰는** 프리셋이다.
+파이프라인은 이 파일을 읽지 않는다.
 
 ```bash
 # .ini 를 단일 출처로 config.json 을 생성한다
@@ -122,13 +156,12 @@ magi/.venv/bin/python pipeline.py \
 | `--transcribe {ocr,vlm}` | `ocr` | 크롭 전사 방식. **일본어가 아닌 페이지가 하나라도 보이면 자동으로 `vlm` 으로 물러난다** |
 | `--thinking [auto\|on\|off]` | `off` | 모델 추론. 값 없이 주면 `on`. `auto` 는 단계별 옛 기본값 |
 | `--workers N` | `4` | 판독 두 단계에서 동시에 던질 요청 수 |
-| `--model-read NAME` | stages 설정 | ② 판독 두 단계의 모델을 강제 |
-| `--model-text NAME` | stages 설정 | ④⑤⑥ 텍스트 단계의 모델을 강제 |
+| `--model ID` | config | 판독·번역 양쪽을 이 모델 id 로 |
+| `--model-read ID` | config `read` | ② 판독 두 단계 (`--model` 보다 우선) |
+| `--model-text ID` | config `translate` | ④⑤⑥ 텍스트 단계 (`--model` 보다 우선) |
 | `--skip-pages N …` | 없음 | 뺄 페이지(1-base). **판독 전에** 적용된다 |
 | `--from-stage` / `--only` | `magi` | 단계 지정 (`magi read merge cast translate validate render`) |
 | `--no-resume` | 재개함 | 끝난 단계도 다시 |
-| `--no-manage-router` | 관리함 | 라우터를 직접 띄우지 않는다 |
-| `--stop-router-for-magi` | 꺼짐 | Magi 전에 라우터를 내린다 (VRAM 32GB 시절 유물) |
 | `--fast` | 꺼짐 | `--transcribe ocr` 의 옛 이름. 경고를 내며 동작한다. 새로 쓰지 말 것 |
 
 **`--transcribe ocr` 의 안전망:** manga-ocr 은 일본어 전용인데, 다른 언어에서는 빈

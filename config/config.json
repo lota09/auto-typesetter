@@ -1,82 +1,27 @@
 {
   "_comment": [
-    "파이프라인의 모델 배치. 단계마다 어느 모델을 쓸지 stages 에서 정한다.",
-    "로컬 llama-server 는 라우터 모드로 띄우면 요청의 model 필드로 온디맨드 교체된다",
-    "(config/models.ini 참조). 그래서 단계별로 다른 모델을 써도 서버를 재기동하지 않는다.",
-    "실측 교체 비용: 콜드 적재 26초, 교체 41초.",
+    "역할 둘. read = ② 페이지 판독·크롭 전사, translate = ④⑤⑥ 인물·시트·번역·검사.",
+    "각 역할은 base_url · api_key_env · model 세 개면 된다. 같은 값을 두 번 적으면",
+    "한 모델이 전 단계를 맡고, 다르게 적으면 판독과 번역이 갈린다 — 서버가 달라도,",
+    "한쪽이 원격 API 여도 상관없다.",
     "",
-    "다른 백엔드로 가려면 backends 에 항목을 추가하고 models 에서 그 backend 를 가리키면 된다.",
-    "우리 호출은 전부 OpenAI 호환 /v1/chat/completions 라 base_url 과 인증만 다르다.",
-    "다만 '추론 끄기' 방법은 제공자마다 달라서 thinking_style 로 구분한다 —",
-    "이 파이프라인에서 추출 단계의 추론을 끄는 것은 선택이 아니라 필수다.",
-    "추론형 모델은 토큰 예산을 사고에 다 쓰고 본문을 비운 채 돌려준다."
+    "나머지는 전부 선택이고 기본값이 있다:",
+    "  thinking_style      llama_cpp | reasoning_effort | none   (기본 llama_cpp)",
+    "  supports_json_schema  기본 true",
+    "  timeout               기본 1800초",
+    "  vision                기본 true. read 역할에는 반드시 true 여야 한다",
+    "  max_image_pixels      기본 없음(원본 크기). 모델이 큰 이미지를 못 받을 때만 적는다",
+    "",
+    "이 파이프라인은 LLM 서버를 띄우지 않는다. 로컬이면 직접 기동해 두어야 한다."
   ],
-  "backends": {
-    "local": {
-      "base_url": "http://127.0.0.1:8081/v1",
-      "api_key_env": null,
-      "thinking_style": "llama_cpp",
-      "supports_json_schema": true,
-      "timeout": 1800
-    },
-    "openai": {
-      "base_url": "https://api.openai.com/v1",
-      "api_key_env": "OPENAI_API_KEY",
-      "thinking_style": "reasoning_effort",
-      "supports_json_schema": true,
-      "timeout": 600
-    },
-    "openrouter": {
-      "base_url": "https://openrouter.ai/api/v1",
-      "api_key_env": "OPENROUTER_API_KEY",
-      "thinking_style": "none",
-      "supports_json_schema": true,
-      "timeout": 600
-    },
-    "local8080": {
-      "base_url": "http://127.0.0.1:8080/v1",
-      "api_key_env": null,
-      "thinking_style": "llama_cpp",
-      "supports_json_schema": true,
-      "timeout": 1800
-    }
+  "read": {
+    "base_url": "http://127.0.0.1:8000/v1",
+    "api_key_env": null,
+    "model": "orcarouter_Qwen3.8-27B_AL_NVFP4-FP8"
   },
-  "models": {
-    "qwen-vl": {
-      "backend": "local",
-      "model": "qwen-vl",
-      "vision": true,
-      "max_image_pixels": null,
-      "note": "판독 담당. Qwen3.6-35B-A3B Q8_K_P. 페이지 판독이 크롭 기준선과 53% 일치 (Gemma 17%)"
-    },
-    "gemma": {
-      "backend": "local",
-      "model": "gemma",
-      "vision": true,
-      "max_image_pixels": 645120,
-      "note": "텍스트 추론·번역 담당. Gemma4-26B-A4B QAT. 이전 빌드 비전 상한 0.65MP — 새 빌드는 재확인 필요"
-    },
-    "q38-uncens": {
-      "backend": "local",
-      "model": "q38-uncens",
-      "vision": true,
-      "max_image_pixels": null,
-      "note": "Qwen3.8-27B Uncensored Q8_K_P — 판독 대조군"
-    },
-    "gemma31": {
-      "backend": "local",
-      "model": "gemma31",
-      "vision": true,
-      "max_image_pixels": 645120,
-      "note": "Gemma4-31B QAT 밀집 — 번역 대조군, 미측정"
-    }
-  },
-  "stages": {
-    "read_page": "qwen-vl",
-    "read_texts": "qwen-vl",
-    "styleguide": "gemma",
-    "translate": "gemma",
-    "repair": "gemma",
-    "judge": "gemma"
+  "translate": {
+    "base_url": "http://127.0.0.1:8000/v1",
+    "api_key_env": null,
+    "model": "orcarouter_Qwen3.8-27B_AL_NVFP4-FP8"
   }
 }

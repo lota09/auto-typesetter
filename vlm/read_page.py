@@ -37,6 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import progress as PROG  # noqa: E402
 from backend import bound_schema, client_for  # noqa: E402
 
 INSTRUCTION = """You are transcribing a comic page for translation.
@@ -56,13 +57,38 @@ For EVERY id, report:
                 known, use a short stable visual description such as
                 "silver-haired maid". Use "narration" for caption boxes that are
                 not spoken by anyone, and "unknown" only if truly undecidable.
-  "kind"        "dialogue" (spoken aloud), "thought", "narration", or "sfx"
+  "kind"        "dialogue"   spoken aloud by a character
+                "thought"    a character's inner voice
+                "narration"  caption boxes that tell the story
+                "sfx"        onomatopoeia
+                "incidental" text that exists inside the story world but nobody
+                             utters: shop signs, street signs, electronic
+                             displays, product labels, book covers, letters
+                "credits"    text that is NOT part of the story at all: author
+                             or artist names, the work's title, chapter number,
+                             page number, website URLs, licence notices, lists
+                             of donors or supporters, publisher marks
+                For "incidental" and "credits", set "speaker" to "none".
   "addressee"   who it is said to, same naming rules, or "" if unclear
 
 Use the speech-bubble tails, who is facing whom, and the flow of the conversation
 to decide the speaker. Keep each speaker's name spelled identically everywhere.
 
-Reply as {{"regions": [ ... ]}} with one object per id, in ascending id order."""
+Be strict about "credits": a page corner carrying the artist's name, a URL, a
+licence line or a donor list is not something a character said, and it must not
+be given a speaker.
+
+ALSO look for text the red boxes MISSED. An automatic detector drew those boxes and
+it does miss things — whole caption panels, small bubbles, text laid over artwork.
+Report each missed region in "missed" with:
+  "text"  what it says, transcribed the same way as above
+  "kind"  same categories as above
+  "box"   [x1, y1, x2, y2] as PER-MILLE of the page (0-1000), left-to-right and
+          top-to-bottom, tight around the text
+Only report a region that is NOT already inside one of the numbered boxes. If every
+piece of text is already boxed, return an empty list. Do not invent text.
+
+Reply as {{"regions": [ ... ], "missed": [ ... ]}}, regions in ascending id order."""
 
 # 응답 형식을 프롬프트로 부탁하지 않고 스키마로 강제한다.
 # 부탁했을 때 8페이지 중 5페이지가 파싱에 실패했다 — 배열 괄호를 빼먹거나,
@@ -81,12 +107,29 @@ RESPONSE_SCHEMA = {
                     "lang": {"type": "string", "enum": ["ja", "zh", "en", "other"]},
                     "speaker": {"type": "string"},
                     "kind": {"type": "string",
-                             "enum": ["dialogue", "thought", "narration", "sfx"]},
+                             "enum": ["dialogue", "thought", "narration", "sfx",
+                                      "incidental", "credits"]},
                     "addressee": {"type": "string"},
                 },
                 "required": ["id", "text", "lang", "speaker", "kind"],
             },
-        }
+        },
+        "missed": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "maxLength": 600},
+                    "kind": {"type": "string",
+                             "enum": ["dialogue", "thought", "narration", "sfx",
+                                      "incidental", "credits"]},
+                    "box": {"type": "array", "minItems": 4, "maxItems": 4,
+                            "items": {"type": "integer"}},
+                },
+                "required": ["text", "box"],
+            },
+        },
     },
     "required": ["regions"],
 }
@@ -109,21 +152,24 @@ lifted from the dialogue rather than a name, use a visual description instead.
 """
 
 REASK_HINT = """
-GEOMETRY CROSS-CHECK — your answer disagrees with an independent detector.
+GEOMETRY CROSS-CHECK — a separate detector may have seen more speakers than you did.
 
-That detector grouped the people on this page by appearance and matched each text
-region to one of them. It found {magi_n} distinct speakers; you used {vlm_n}.
-Its region-to-group assignment was:
+It grouped the drawn figures on this page by appearance and anchored each text
+region to one of them, using speech-bubble tails and body positions. It cannot
+read the dialogue. Its grouping was:
 {grouping}
 
-The detector is often wrong about *who* a person is, and it cannot read the
-dialogue at all. But it is reliable about **how many separate people are present**
-and about which regions are anchored to the same person, because it works from
-speech-bubble tails and body positions.
+That grouping put the regions into {magi_n} groups, while you assigned {vlm_n}
+distinct speakers.
 
-Reconsider with that in mind. A long stretch of lines that alternates between
-asking and answering, or that contains a term of address, cannot all come from one
-speaker. Produce the full answer again for every id."""
+**Treat this as a question, not a correction.** The detector splits and merges
+figures by how they are drawn, so it can be wrong in either direction. Use it only
+to ask yourself whether you collapsed two different people into one label: a
+stretch of lines that alternates between asking and answering, or that contains a
+term of address, cannot all come from one speaker.
+
+If, after re-reading, you still think your original assignment was right, keep it.
+Produce the full answer again for every id."""
 
 
 class Cast:
@@ -140,7 +186,8 @@ class Cast:
     """
 
     # 사람이 아닌 라벨. 명부에 올리면 인물처럼 취급되어 오염된다.
-    NON_PERSON = {"narration", "unknown", "", "sfx", "none"}
+    NON_PERSON = {"narration", "unknown", "", "sfx", "none",
+                  "incidental", "credits"}
 
     def __init__(self):
         self.entries = {}   # 라벨 → {"pages": [...], "count": n}
@@ -237,12 +284,60 @@ def ask_page(client, data_url, instruction, max_tokens, thinking):
     요청에 model 이 없으면 400 이 나므로, 직접 post 하지 않고 반드시 Client 를
     거쳐야 한다.
     """
-    return client.chat(
+    res = client.chat(
         [{"type": "image_url", "image_url": {"url": data_url}},
          {"type": "text", "text": instruction}],
         schema=RESPONSE_SCHEMA, schema_name="regions",
         thinking=thinking, max_tokens=max_tokens, temperature=0.0,
-    )["regions"]
+    )
+    return res["regions"], res.get("missed") or []
+
+
+def adopt_missed(pg, missed, size, existing_ids):
+    """VLM 이 "빨간 박스가 놓쳤다" 고 한 영역을 박스로 받아들인다.
+
+    필요한 이유: Magi 가 통째로 놓치는 영역이 있다. 실측(maid2 12쪽)에서 세로
+    캡션 `幫忙早上整理打扮` 은 두 번의 실행 모두 검출되지 않았고, `主人` 은 한
+    실행에서는 잡히고 다른 실행에서는 빠졌다 — 검출이 불안정하다. 안 잡히면
+    지워지지도 번역되지도 않으므로 **원문이 그대로 남는다.**
+
+    좌표는 거칠어도 된다. 뒤에서 말풍선 확장이 실제 말풍선에 맞춰 넓히고,
+    마스크는 박스 안의 획을 찾아 지운다.
+    """
+    W, H = size
+    out, nid = [], max(existing_ids, default=-1) + 1
+    boxes = [t["bbox"] for t in pg["texts"]]
+    for m in missed:
+        if not (m.get("text") or "").strip():
+            continue
+        try:
+            a, b, c, d = [int(v) for v in m["box"]]
+        except (KeyError, TypeError, ValueError):
+            continue
+        x1, y1 = max(0, min(a, c)) * W // 1000, max(0, min(b, d)) * H // 1000
+        x2, y2 = min(1000, max(a, c)) * W // 1000, min(1000, max(b, d)) * H // 1000
+        if x2 - x1 < 8 or y2 - y1 < 8:
+            continue
+        # 페이지의 4분의 1을 넘는 "글자 영역" 은 없다. 헛짚은 것이다.
+        if (x2 - x1) * (y2 - y1) > 0.25 * W * H:
+            continue
+        # 이미 있는 박스와 절반 넘게 겹치면 중복이다.
+        dup = False
+        for bx1, by1, bx2, by2 in boxes:
+            ox = max(0, min(x2, bx2) - max(x1, bx1))
+            oy = max(0, min(y2, by2) - max(y1, by1))
+            if ox * oy > 0.5 * min((x2 - x1) * (y2 - y1),
+                                   max(1, (bx2 - bx1) * (by2 - by1))):
+                dup = True
+                break
+        if dup:
+            continue
+        out.append({"id": nid, "bbox": [x1, y1, x2, y2], "ocr": None,
+                    "essential": True, "speaker": None, "speaker_cluster": None,
+                    "has_tail": False, "found_by": "vlm"})
+        boxes.append([x1, y1, x2, y2])
+        nid += 1
+    return out
 
 
 
@@ -270,6 +365,8 @@ def main():
     p = argparse.ArgumentParser(description="페이지 단위 전사 + 화자 판정")
     p.add_argument("--magi-json", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--log", help="이 경로에 전체 로그를 덧붙인다 "
+                   "(터미널은 짧게, 파일은 빠짐없이)")
     p.add_argument("--config", help="config.json 경로 (기본: config/config.json)")
     p.add_argument("--model", help="stages 설정을 무시하고 이 모델을 쓴다")
     p.add_argument("--pages", type=int, nargs="+", help="이 페이지(1-base)만 처리")
@@ -288,6 +385,8 @@ def main():
                    help="Magi 와 화자 수가 어긋나면 Magi 그룹핑을 힌트로 다시 묻는다")
     p.add_argument("--no-reask", dest="reask_on_disagreement", action="store_false",
                    help="교차 검증 재질의를 끈다")
+    p.add_argument("--no-adopt-missed", action="store_true",
+                   help="Magi 가 놓친 영역을 판독이 보고해도 박스로 만들지 않는다")
     p.add_argument("--workers", type=int, default=4,
                    help="동시에 던질 페이지 수. **--no-cast-memory 일 때만** 적용된다 "
                         "— 명부를 물려주면 페이지 N 이 1..N-1 에 의존하므로 순서를 "
@@ -296,6 +395,7 @@ def main():
                    help="추론을 켠다. 화자 판정에는 도움이 될 수 있으나 느리다")
     args = p.parse_args()
 
+    PROG.open_log(getattr(args, 'log', None))
     doc = json.load(open(args.magi_json, encoding="utf-8"))
     client = client_for("read_page", args.config, args.model)
     if not client.health():
@@ -344,7 +444,7 @@ def main():
         return 2
 
     t0 = time.time()
-    done = missing_total = 0
+    done = missing_total = adopted_total = 0
     cast = Cast()
     out_lock = threading.Lock()
 
@@ -377,7 +477,8 @@ def main():
         rows = None
         for attempt, budget in enumerate((args.max_tokens, args.max_tokens * 2), 1):
             try:
-                rows = ask_page(client, data_url, instruction, budget, args.thinking)
+                rows, missed = ask_page(client, data_url, instruction, budget,
+                                        args.thinking)
                 break
             except Exception as e:
                 # 대부분 응답이 토큰 한도에서 잘려 JSON 이 깨진 경우다. 예산을
@@ -416,14 +517,22 @@ def main():
         vlm_n = speaker_count(by_id)
         # 대사 박스가 2개 미만이면 화자 수로는 아무것도 알 수 없다. 나레이션·효과음
         # 전용 페이지에서 허위 불일치가 나던 원인이다.
+        # **비대칭이다.** Magi 가 VLM 보다 *많이* 셀 때만 다시 묻는다.
+        #
+        # 근거: maid2 실측에서 두 값이 어긋난 20쪽 중 12쪽이 "Magi 가 더 적게" 였고,
+        # 그 방향은 대개 Magi 가 **닮은꼴 인물을 한 클러스터로 합친** 것이다
+        # (같은 제복을 입은 인물이 여럿인 작품에서 특히). 그걸 근거로 VLM 에게
+        # 화자를 합치라고 지시하면 인물 과병합을 우리가 만들어 내게 된다.
+        # 반대 방향(Magi 가 더 많음)은 "VLM 이 둘을 하나로 봤다" 는 분리 증거이고,
+        # 분리는 말풍선 꼬리·신체 위치에서 나오므로 그나마 믿을 만하다.
         comparable = len(spoken) >= 2 and magi_n > 0
-        agreed = (not comparable) or magi_n == vlm_n
+        agreed = (not comparable) or magi_n <= vlm_n
         if not agreed and args.reask_on_disagreement and grouping:
             with out_lock:
-                print(f"p{pg['index']+1} 화자 수 불일치 "
-                      f"(Magi {magi_n} vs VLM {vlm_n}) → 재질의", flush=True)
+                print(f"p{pg['index']+1} 화자 수 (Magi {magi_n} > VLM {vlm_n}) "
+                      f"→ 합쳤는지 재확인", flush=True)
             try:
-                rows2 = ask_page(
+                rows2, _ = ask_page(
                     client, data_url,
                     instruction + REASK_HINT.format(magi_n=magi_n, vlm_n=vlm_n,
                                                     grouping=grouping),
@@ -442,8 +551,18 @@ def main():
             with out_lock:
                 print(msg, flush=True)
         return {"by_id": by_id, "magi_n": magi_n, "vlm_n": vlm_n,
-                "spoken": spoken, "comparable": comparable,
+                "spoken": spoken, "comparable": comparable, "missed": missed,
                 "sent_size": sent_size, "seconds": time.time() - t, "n": n}
+
+    # 이 단계가 모든 페이지 요청에 공통으로 넣는 것을 한 번만 남긴다. 박스 수·id
+    # 목록만 페이지마다 달라지므로 표본으로 하나를 채워 보여준다.
+    PROG.prompt_block(
+        "② 페이지 판독 (화자·언어)",
+        INSTRUCTION.format(n="<박스 수>", ids="<박스 id 목록>"),
+        {"페이지마다 덧붙는 인물 명부(CAST_HINT)": CAST_HINT.format(cast="<지금까지의 명부>"),
+         "화자 수가 어긋날 때만 덧붙는 재질의(REASK_HINT)":
+             REASK_HINT.format(magi_n="<기하 검출 수>", vlm_n="<판독 수>",
+                               grouping="<박스→인물 배정>")})
 
     # ① 묻기. --no-cast-memory 일 때만 동시에 던진다.
     workers = args.workers if args.no_cast_memory else 1
@@ -485,13 +604,31 @@ def main():
         # 페이지 언어는 박스 다수결로 정한다. 효과음 한 칸이 페이지 언어를
         # 뒤집지 않게 하려는 것이다.
         pg["source_lang"] = max(langs, key=langs.get) if langs else None
+
+        # Magi 가 놓친 영역을 VLM 이 본 대로 받아들인다. 전사는 비워 두고 —
+        # 다음 단계(크롭 전사)가 채운다. 좌표가 거칠어도 말풍선 확장이 맞춘다.
+        if not args.no_adopt_missed and r.get("missed"):
+            extra = adopt_missed(pg, r["missed"],
+                                 (pg["size"][0], pg["size"][1]),
+                                 [t["id"] for t in pg["texts"]])
+            for e, m in zip(extra, [x for x in r["missed"]][:len(extra)]):
+                e_txt = (m.get("text") or "").strip()
+                pg["texts"].append(dict(e, ocr=e_txt or None, speaker_name=None,
+                                        addressee=None,
+                                        kind=(m.get("kind") or "dialogue"),
+                                        lang=pg.get("source_lang")))
+            if extra:
+                adopted_total += len(extra)
+                PROG.log(f"  p{pg['index']+1} Magi 가 놓친 영역 {len(extra)}개를 "
+                         f"판독에서 받아들였습니다")
         miss = [t["id"] for t in pg["texts"] if t["id"] not in by_id]
         done += 1
-        print(f"p{pg['index']+1} {n}개 박스 → 언어 {pg['source_lang']}, "
-              f"화자 {len({t['speaker_name'] for t in pg['texts'] if t.get('speaker_name')})}명"
-              f"{f', 누락 {miss}' if miss else ''}  "
-              f"({r['seconds']:.1f}초, 전송 {r['sent_size'][0]}x{r['sent_size'][1]})",
-              flush=True)
+        PROG.step(f"  [{done}/{len(doc['pages'])}] p{pg['index']+1} 박스 {n}개 · "
+                  f"화자 {len({t['speaker_name'] for t in pg['texts'] if t.get('speaker_name')})}명"
+                  f"{f' · 누락 {miss}' if miss else ''} "
+                  f"({r['seconds']:.1f}초, {r['sent_size'][0]}x{r['sent_size'][1]})")
+
+    PROG.done()
 
     doc["read_page_pass"] = {"model": client.name, "max_side": args.max_side,
                              "cast_memory": not args.no_cast_memory}
@@ -500,11 +637,11 @@ def main():
         json.dump(doc, fh, ensure_ascii=False, indent=1)
 
     if cast.render():
-        print("\n[등장인물 명부]\n" + cast.render())
+        PROG.log("\n[등장인물 명부]\n" + cast.render())
     doc["cast"] = cast.entries
     doc["read_failures"] = failed
-    print(f"\n페이지 {done}/{len(targets)} 처리, 박스 누락 {missing_total}개  "
-          f"({time.time()-t0:.1f}초) → {args.out}")
+    PROG.log(f"\n페이지 {done}/{len(targets)} 처리, 박스 누락 {missing_total}개  "
+             f"({time.time()-t0:.1f}초) → {args.out}")
     if failed:
         print(f"건너뛴 페이지 {len(failed)}장: {failed}  "
               f"— 다시 실행하면 이 페이지만 재시도합니다")

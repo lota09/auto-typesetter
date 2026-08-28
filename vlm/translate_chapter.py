@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import requests
 
+import progress as PROG  # noqa: E402
 from backend import bound_schema, client_for, usage_line  # noqa: E402
 from register_cues import (contradictions, evidence_by_speaker,  # noqa: E402
                             render_evidence)
@@ -204,7 +205,12 @@ Transcript:
 {transcript}"""
 
 
-def load_lines(doc, include_empty=False):
+# 작품 바깥의 글. 번역하지 않는다 — 작가명·URL·라이선스·후원자 명단을 한국어로
+# 옮겨 말풍선처럼 얹으면 판권면을 통째로 덮어쓴다(실측: 그 쪽만 마스크 22%).
+SKIP_KINDS = {"credits"}
+
+
+def load_lines(doc, include_empty=False, skip_kinds=SKIP_KINDS):
     """챕터 전사를 한 줄씩, 안정적인 key 와 함께 만든다.
 
     key 는 페이지·박스 번호에서 만든다. 모델이 만든 이름이 아니라 우리 좌표에
@@ -213,6 +219,8 @@ def load_lines(doc, include_empty=False):
     lines, keys = [], []
     for pg in doc["pages"]:
         for t in pg["texts"]:
+            if (t.get("kind") or "") in skip_kinds:
+                continue
             text = (t.get("ocr") or "").strip()
             if not text and not include_empty:
                 continue
@@ -273,6 +281,8 @@ def main():
                    help="작품 단위 스타일 시트 JSON. 없으면 만들고, 있으면 물려 쓴다")
     p.add_argument("--rebuild-styleguide", action="store_true",
                    help="시트가 이미 있어도 다시 만든다")
+    p.add_argument("--log", help="이 경로에 전체 로그를 덧붙인다 "
+                   "(터미널은 짧게, 파일은 빠짐없이)")
     p.add_argument("--config")
     p.add_argument("--sheet-model", help="시트 단계 모델 강제")
     p.add_argument("--translate-model", help="번역 단계 모델 강제")
@@ -298,6 +308,7 @@ def main():
                    help="증거와 모순될 때 시트를 다시 만들 횟수")
     args = p.parse_args()
 
+    PROG.open_log(getattr(args, 'log', None))
     doc = json.load(open(args.page_json, encoding="utf-8"))
     lines, keys = load_lines(doc)
     if not lines:
@@ -352,6 +363,15 @@ def main():
         # 추론을 켜면 토큰을 많이 먹는다. 예산이 모자라면 본문이 비어서 돌아오므로
         # (finish_reason=length) 시트 호출은 별도 예산을 쓰고, 그래도 모자라면
         # 추론을 끄고 한 번 더 시도한다. 실패로 끝내는 것보다 낫다.
+        PROG.prompt_block(
+            "⑤ 말투 시트",
+            STYLEGUIDE_PROMPT.format(transcript="<챕터 전사 전문>",
+                                     evidence="<아래 원문 말투 증거>",
+                                     cast_block="<아래 확정 인물>"),
+            {"원문에서 계산한 말투 증거 (register_cues)": evidence,
+             "확정 인물 (build_cast 산출)": cast_block,
+             "모순이 있을 때만 덧붙는 교정 프롬프트":
+                 SHEET_FIX_PROMPT.split("{")[0].rstrip()})
         try:
             sg = ask(sheet_client,
                      STYLEGUIDE_PROMPT.format(transcript=transcript, evidence=evidence,
@@ -399,7 +419,8 @@ def main():
               f"용어 {len(sg['glossary'])}개 → {args.styleguide}")
 
     sheet = render_styleguide(sg)
-    print("\n" + sheet + "\n")
+    # 시트는 **번역 요청마다 통째로** 들어간다 — 공통 프롬프트의 일부다.
+    PROG.log("\n" + sheet + "\n")
 
     # ── 2) 일괄 번역 ──────────────────────────────────────────────────────
     t = time.time()
@@ -407,8 +428,14 @@ def main():
     # 관계와 의도가 여기서 들어온다 — 짧은 대사의 말투를 정하는 근거가 된다.
     story = doc.get("story")
     story_block = f"\nCHAPTER CONTEXT — what happens in this chapter:\n{story}\n" if story else ""
-    if story:
-        print(f"줄거리를 번역 맥락으로 사용합니다 ({len(story)}자)")
+    # 이 단계가 **모든 배치에 공통으로** 넣는 것 전부: 지시문 + 줄거리 + 시트.
+    # 배치마다 달라지는 것은 번역할 줄 목록뿐이다.
+    PROG.prompt_block(
+        "⑤ 번역",
+        TRANSLATE_PROMPT.format(story="<아래 줄거리>", styleguide="<아래 시트>",
+                                transcript="<이 배치의 원문 줄>"),
+        {"줄거리 (build_cast 산출, 매 배치에 동봉)": story or "(없음)",
+         "말투 시트 (매 배치에 통째로 동봉)": sheet})
     # 번역 출력은 **줄마다 한 항목**이라 챕터 길이에 그대로 비례한다. 시트와
     # 달리 줄일 방법이 없다 — 모든 대사의 번역문이 결과에 있어야 한다.
     # 692줄짜리 챕터에서 이 요청 하나가 3만 토큰을 넘겨 잘렸다. 그래서 나눈다.

@@ -26,6 +26,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import progress as PROG  # noqa: E402
 from backend import bound_schema, client_for  # noqa: E402
 from translate_chapter import render_styleguide, ask, TRANSLATION_SCHEMA  # noqa: E402
 
@@ -365,6 +366,8 @@ def main():
     p.add_argument("--repair-temperature", type=float, default=0.25,
                    help="회차당 올릴 온도 (1회차는 0). 0 이면 그리디라 회차를 "
                         "반복해도 같은 출력이 나온다")
+    p.add_argument("--log", help="이 경로에 전체 로그를 덧붙인다 "
+                   "(터미널은 짧게, 파일은 빠짐없이)")
     p.add_argument("--config")
     p.add_argument("--model", help="stages 설정을 무시하고 이 모델을 쓴다")
     p.add_argument("--min-ratio", type=float, default=0.25)
@@ -373,6 +376,7 @@ def main():
     p.add_argument("--timeout", type=float, default=1800)
     args = p.parse_args()
 
+    PROG.open_log(getattr(args, 'log', None))
     doc = json.load(open(args.translated_json, encoding="utf-8"))
     sg = json.load(open(args.styleguide, encoding="utf-8"))
     sg_index = build_index(sg)
@@ -409,6 +413,9 @@ def main():
             print(f"    ✗ {code}: {msg}")
 
     sheet = render_styleguide(sg)
+    PROG.prompt_block("⑥ 검사·자동수정",
+                      "[수정] " + REPAIR_PROMPT.split("{")[0].rstrip(),
+                      {"[심사] JUDGE_PROMPT": JUDGE_PROMPT.split("{")[0].rstrip()})
     repair_client = client_for("repair", args.config, args.model)
     judge_client = client_for("judge", args.config, args.model)
 

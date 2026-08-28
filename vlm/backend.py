@@ -99,20 +99,30 @@ class Client:
         return sess
 
     # ── 상태 확인 ────────────────────────────────────────────────────────
-    def health(self):
-        """로컬 서버만 /health 를 준다. 원격은 확인을 생략한다."""
-        if not self.base_url.startswith("http://127.0.0.1") and \
-           not self.base_url.startswith("http://localhost"):
-            return True
-        root = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
+    def served_models(self, timeout=10):
+        """서버가 지금 내놓는 모델 이름 목록. 실패하면 None."""
         try:
-            r = self.session.get(root + "/health", timeout=10)
-            if r.status_code == 200:
-                return True
-            # 라우터 모드는 모델이 적재되기 전에는 /health 가 200 이 아닐 수 있다.
-            return self.session.get(self.base_url + "/models", timeout=10).status_code == 200
-        except requests.RequestException:
+            r = self.session.get(self.base_url + "/models", timeout=timeout)
+            if r.status_code != 200:
+                return None
+            return [m.get("id") for m in (r.json().get("data") or [])]
+        except (requests.RequestException, ValueError):
+            return None
+
+    def health(self):
+        """살아 있고 **우리가 원하는 모델을 내놓는지**까지 본다.
+
+        200 만 보면 안 된다. 새 서버를 기다리다 **옛 서버**의 200 을 보고 통과하거나,
+        기동에 실패했는데 이전 서버가 살아남아 그걸로 측정한 사고가 실제로 있었다
+        (vLLM 학습 문서의 측정 함정 목록). 엔진을 갈아 끼우는 지금은 더 위험하다 —
+        포트는 같은데 모델이 다를 수 있다.
+        """
+        names = self.served_models()
+        if names is None:
             return False
+        # 라우터(llama.cpp)는 적재 전에도 프리셋 전체를 나열한다. 이름만 맞으면 된다.
+        # 원격 API 도 같은 방식으로 본다 — 로컬이라고 다르게 취급하지 않는다.
+        return self.model in names
 
     # ── 요청 조립 ────────────────────────────────────────────────────────
     def _apply_thinking(self, payload, thinking):
@@ -248,18 +258,41 @@ def usage_line(*clients):
     return f"[usage] calls={c} prompt={p} completion={g}"
 
 
+# 단계 → 역할. read 는 이미지를 보고, translate 는 글만 다룬다.
+ROLE_OF_STAGE = {
+    "read_page": "read", "read_texts": "read",
+    "styleguide": "translate", "translate": "translate",
+    "repair": "translate", "judge": "translate",
+}
+
+# 역할 설정에서 생략할 수 있는 것들의 기본값. config 에는 base_url·api_key_env·
+# model 만 있으면 된다.
+ROLE_DEFAULTS = {
+    "thinking_style": "llama_cpp",
+    "supports_json_schema": True,
+    "timeout": 1800,
+    "vision": True,
+    "max_image_pixels": None,
+}
+
+
 def client_for(stage, config=None, override=None):
-    """단계 이름으로 호출기를 만든다. override 로 모델을 강제할 수 있다."""
+    """단계 이름으로 호출기를 만든다. override 로 모델 id 를 강제할 수 있다."""
     cfg = config if isinstance(config, dict) else load_config(config)
-    name = override or (cfg.get("stages") or {}).get(stage)
-    if not name:
-        raise ConfigError(f"stages 에 '{stage}' 항목이 없습니다")
-    models = cfg.get("models") or {}
-    if name not in models:
-        raise ConfigError(f"models 에 '{name}' 이 없습니다")
-    mc = models[name]
-    backends = cfg.get("backends") or {}
-    bname = mc.get("backend")
-    if bname not in backends:
-        raise ConfigError(f"backends 에 '{bname}' 이 없습니다 (모델 {name})")
-    return Client(name, mc, backends[bname])
+    role = ROLE_OF_STAGE.get(stage)
+    if role is None:
+        raise ConfigError(f"'{stage}' 는 read/translate 어느 역할에도 속하지 않습니다")
+    spec = cfg.get(role)
+    if not isinstance(spec, dict):
+        raise ConfigError(f"config 에 '{role}' 역할이 없습니다 "
+                          f"(base_url · api_key_env · model 이 필요합니다)")
+    merged = dict(ROLE_DEFAULTS)
+    merged.update(spec)
+    if not merged.get("base_url"):
+        raise ConfigError(f"'{role}' 역할에 base_url 이 없습니다")
+    model = override or merged.get("model")
+    if not model:
+        raise ConfigError(f"'{role}' 역할에 model 이 없습니다")
+    # Client 는 모델 설정과 백엔드 설정을 나눠 받는다. 지금은 한 덩어리라 둘로 준다.
+    return Client(model, {"model": model, "vision": merged["vision"],
+                          "max_image_pixels": merged["max_image_pixels"]}, merged)

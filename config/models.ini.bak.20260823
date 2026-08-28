@@ -1,0 +1,97 @@
+; llama-server 라우터 프리셋.
+;
+; 섹션 이름이 API 요청의 "model" 값이 된다. 키는 `--` 를 뗀 CLI 옵션명이다.
+; 라우터 모드로 띄우면 요청마다 모델이 온디맨드로 교체되므로, 파이프라인 쪽에서
+; 서버를 재기동할 필요가 없다 (실측: 콜드 적재 26초, 교체 41초).
+;
+; 공통 섹션을 만들어도 **상속되지 않는다**. `[common]` 을 두고 확인해 보니 그
+; 섹션이 별개 모델로 등록될 뿐이고, 다른 섹션의 인자에는 반영되지 않았다
+; (VRAM 사용량이 q8_0 KV 가 아니라 f16 KV 와 일치했다). 그래서 아래처럼
+; 섹션마다 전부 명시한다. 중복이 보기 싫지만 조용히 빠지는 것보다 낫다.
+;
+; 플래그 근거는 ~/llamacpp/run_llama_server.sh 의 실측표를 따랐다.
+;   - cache-type q8_0 : f16 대비 VRAM 절반, 속도 손해 없음 → 같은 VRAM 으로 2배 긴 컨텍스트
+;   - parallel 1      : 개인용은 동시 요청이 없으므로 지연시간에 유리
+;   - flash-attn on   : gfx906 에서도 이득
+
+[qwen-vl]
+; 판독(비전) 담당. image-min-tokens 는 Qwen-VL 전용 처방이다 — 작은 말풍선을
+; 크롭해 보낼 때 이미지 토큰이 부족하면 큰 세로쓰기 블록이 통째로 EMPTY 로 온다.
+model = /home/myubuntu/llamacpp/models/HauhauCS_Qwen3.6-35B-A3B-Uncensored-Aggressive-Q4_K_M/HauhauCS_Qwen3.6-35B-A3B-Uncensored-Aggressive-Q4_K_M.gguf
+mmproj = /home/myubuntu/llamacpp/models/HauhauCS_Qwen3.6-35B-A3B-Uncensored-Aggressive-Q4_K_M/HauhauCS_Qwen3.6-35B-A3B-Uncensored-Aggressive-Q4_K_M_mmproj-f16.gguf
+image-min-tokens = 1024
+ctx-size = 93184
+n-gpu-layers = 99
+parallel = 1
+flash-attn = on
+cache-type-k = q8_0
+cache-type-v = q8_0
+reasoning = on
+
+[gemma]
+; 텍스트 추론·번역 담당. image-min-tokens 를 주면 로드가 실패한다
+; (image_max_pixels 645120 < image_min_pixels 2359296). 비전 상한이 0.65MP 라
+; 페이지 판독에는 쓸 수 없다 — 실측에서 박스 경계를 넘어 내용이 새었다.
+model = /home/myubuntu/llamacpp/models/Gemma4-26B-A4B-Uncensored-HauhauCS-Balanced-Q8_K_P/Gemma4-26B-A4B-Uncensored-HauhauCS-Balanced-Q8_K_P.gguf
+mmproj = /home/myubuntu/llamacpp/models/Gemma4-26B-A4B-Uncensored-HauhauCS-Balanced-Q8_K_P/Gemma4-26B-A4B-Uncensored-HauhauCS-Balanced-Q8_K_P_mmproj-gemma4-26b-a4b-uncensored-hauhaucs-balanced-f16.gguf
+ctx-size = 65536
+n-gpu-layers = 99
+parallel = 1
+flash-attn = on
+cache-type-k = q8_0
+cache-type-v = q8_0
+reasoning = on
+
+; ── Qwen3.8 빌드 비교용 ─────────────────────────────────────────────
+; 두 변수를 분리해 잰다:
+;   ablit vs uncens vs unsloth  → 빌드 조작이 CJK 전사를 해치는가
+;   unsloth q6 vs q4            → 같은 계열 안에서 양자화 영향
+; ctx 는 비교 목적상 넉넉히 동일하게 둔다.
+
+[q38-ablit]
+model = /home/myubuntu/llamacpp/models/Blackfrost-AI_Qwen3.8-27B-ABLITERATED-Q6_K/Blackfrost-AI_Qwen3.8-27B-ABLITERATED-Q6_K.gguf
+mmproj = /home/myubuntu/llamacpp/models/Blackfrost-AI_Qwen3.8-27B-ABLITERATED-Q6_K/Blackfrost-AI_Qwen3.8-27B-ABLITERATED-Q6_K_mmproj-f16.gguf
+image-min-tokens = 1024
+ctx-size = 32768
+n-gpu-layers = 99
+parallel = 1
+flash-attn = on
+cache-type-k = q8_0
+cache-type-v = q8_0
+reasoning = on
+
+[q38-uncens]
+model = /home/myubuntu/llamacpp/models/HauhauCS_Qwen3.8-27B-Uncensored-Aggressive-Q6_K_P/HauhauCS_Qwen3.8-27B-Uncensored-Aggressive-Q6_K_P.gguf
+mmproj = /home/myubuntu/llamacpp/models/HauhauCS_Qwen3.8-27B-Uncensored-Aggressive-Q6_K_P/HauhauCS_Qwen3.8-27B-Uncensored-Aggressive-Q6_K_P_mmproj-bf16.gguf
+image-min-tokens = 1024
+ctx-size = 32768
+n-gpu-layers = 99
+parallel = 1
+flash-attn = on
+cache-type-k = q8_0
+cache-type-v = q8_0
+reasoning = on
+
+[q38-unsloth-q6]
+model = /home/myubuntu/llamacpp/models/unsloth_Qwen3.8-27B-UD-Q6_K_XL/unsloth_Qwen3.8-27B-UD-Q6_K_XL.gguf
+mmproj = /home/myubuntu/llamacpp/models/unsloth_Qwen3.8-27B-UD-Q6_K_XL/unsloth_Qwen3.8-27B-UD-Q6_K_XL_mmproj-bf16.gguf
+image-min-tokens = 1024
+ctx-size = 32768
+n-gpu-layers = 99
+parallel = 1
+flash-attn = on
+cache-type-k = q8_0
+cache-type-v = q8_0
+reasoning = on
+
+[q38-unsloth-q4]
+model = /home/myubuntu/llamacpp/models/unsloth_Qwen3.8-27B-UD-Q4_K_M/unsloth_Qwen3.8-27B-UD-Q4_K_M.gguf
+mmproj = /home/myubuntu/llamacpp/models/unsloth_Qwen3.8-27B-UD-Q4_K_M/unsloth_Qwen3.8-27B-UD-Q4_K_M_mmproj-bf16.gguf
+image-min-tokens = 1024
+ctx-size = 32768
+n-gpu-layers = 99
+parallel = 1
+flash-attn = on
+cache-type-k = q8_0
+cache-type-v = q8_0
+reasoning = on

@@ -52,6 +52,7 @@ KEY_RE = re.compile(r"^p\d+_t\d+$")
 RESERVED_BY_KIND = {"narration": "narration", "sfx": "sfx"}
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import progress as PROG  # noqa: E402
 from backend import bound_schema, client_for, usage_line  # noqa: E402
 
 CAST_SCHEMA = {
@@ -146,6 +147,8 @@ def main():
     p = argparse.ArgumentParser(description="인물 정규화 + 스토리 추출")
     p.add_argument("--read-json", required=True, help="read_page/merge 출력")
     p.add_argument("--out", required=True)
+    p.add_argument("--log", help="이 경로에 전체 로그를 덧붙인다 "
+                   "(터미널은 짧게, 파일은 빠짐없이)")
     p.add_argument("--config")
     p.add_argument("--model", help="stages 설정을 무시하고 이 모델을 쓴다")
     p.add_argument("--max-tokens", type=int, default=16384)
@@ -153,6 +156,7 @@ def main():
                    help="추론을 끈다. 이 단계는 관계를 저울질하는 추론 과제다")
     args = p.parse_args()
 
+    PROG.open_log(getattr(args, 'log', None))
     doc = json.load(open(args.read_json, encoding="utf-8"))
     transcript, keys = build_transcript(doc)
     if not transcript:
@@ -165,6 +169,7 @@ def main():
         return 3
     print(f"모델: {client.name} | 대사 {len(keys)}줄, {len(transcript)}자")
 
+    PROG.prompt_block("④ 인물·스토리", PROMPT.format(transcript="<챕터 전사 전문>"))
     res = client.chat(PROMPT.format(transcript=transcript), schema=CAST_SCHEMA,
                       schema_name="cast", thinking=not args.no_thinking,
                       max_tokens=args.max_tokens)

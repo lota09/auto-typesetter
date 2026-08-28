@@ -26,7 +26,8 @@ def main():
     p = argparse.ArgumentParser(description="models.ini → config.json 동기화")
     p.add_argument("--ini", default=os.path.join(ROOT, "config", "models.ini"))
     p.add_argument("--config", default=os.path.join(ROOT, "config", "config.json"))
-    p.add_argument("--backend", default="local", help="새 항목에 붙일 백엔드 이름")
+    p.add_argument("--backend", default="llamacpp",
+                   help="새 항목에 붙일 백엔드 이름 (config.json 의 backends 키)")
     p.add_argument("--check", action="store_true",
                    help="쓰지 않고 어긋난 항목만 보고한다 (CI·사전 점검용)")
     args = p.parse_args()

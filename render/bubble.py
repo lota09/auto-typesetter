@@ -93,7 +93,13 @@ def bubble_mask(img, bbox, search_scale=3.0, tol=18, max_area_ratio=0.5):
     pick = max(inside or cnts, key=cv2.contourArea)
     solid = np.zeros(filled.shape, np.uint8)
     cv2.drawContours(solid, [pick], -1, 1, thickness=-1)
-    return solid, (sx1, sy1, sx2, sy2)
+    # **가둠 검사.** 채운 영역이 탐색창 테두리에 닿았으면 말풍선 안에서 멈춘 게
+    # 아니라 페이지로 샌 것이다. 말풍선 없는 대사(열린 배경 위 글자)에서 이런 일이
+    # 난다 — 조판 자리로는 그럭저럭 쓸 수 있지만 **마스크로 쓰면 그림을 지운다**
+    # (실측 ep11cn 3쪽: 마스크 1.6% → 19.9%, 패널 두 개의 그림이 뭉개졌다).
+    enclosed = not (solid[0, :].any() or solid[-1, :].any()
+                    or solid[:, 0].any() or solid[:, -1].any())
+    return solid, (sx1, sy1, sx2, sy2, enclosed)
 
 
 def largest_inscribed_rect(mask, downscale=4):
@@ -132,29 +138,42 @@ def largest_inscribed_rect(mask, downscale=4):
 TOL_LADDER = (12, 18, 26, 36)
 
 
-def typeset_rect_multi(img, bbox, min_gain=1.15, tols=TOL_LADDER, **kw):
-    """허용치를 여러 개 시도해 가장 넓은 유효 사각형을 고른다.
+# 탐색창 배수 사다리. **텍스트 박스가 작으면 창도 작아져 말풍선을 통째로 놓친다** —
+# 그게 "글자가 불합리하게 작다" 의 원인이었다. 실측(maid2 12쪽):
+#   `早安` 74x128 → 배수 3·5 실패, 배수 8 에서 11.27 배 사각형을 찾았다
+#   `我為您送上餐點` 95x223 → 배수 3 실패, 배수 8 에서 9.50 배
+# 원문이 두 글자여도 말풍선은 크다. 한국어는 길어지므로 그 자리를 써야 한다.
+SCALE_LADDER = (3.0, 5.0, 8.0)
+
+
+def typeset_rect_multi(img, bbox, min_gain=1.15, tols=TOL_LADDER,
+                       scales=SCALE_LADDER, require_enclosed=False, **kw):
+    """허용치와 탐색창 배수를 훑어 가장 넓은 유효 사각형을 고른다.
 
     실패 원인이 반대 방향으로 갈리기 때문이다 (실측 92 개 중):
       대비 부족 9 개  — 허용치가 작아 말풍선 안에서 멈춘다 → 키워야 한다
       번짐 유출 7 개  — 허용치가 커서 페이지로 샌다 → 줄여야 한다
     고정값 하나로 둘 다 맞출 수 없다. 사다리로 훑고 **안전 검사를 통과한 것 중
-    가장 넓은 것**을 쓴다. 유출은 기존 면적 검사가 걸러내므로 큰 값을 시도해도
-    위험이 늘지 않는다.
+    가장 넓은 것**을 쓴다. 유출은 기존 면적 검사(max_area_ratio)와 중심 포함
+    검사가 걸러내므로 큰 값을 시도해도 위험이 늘지 않는다.
     """
     best, best_area, used = None, 0, False
     x1, y1, x2, y2 = (int(round(v)) for v in bbox)
-    for tol in tols:
-        rect, ok = typeset_rect(img, bbox, min_gain=min_gain, tol=tol, **kw)
-        if not ok:
-            continue
-        area = (rect[2] - rect[0]) * (rect[3] - rect[1])
-        if area > best_area:
-            best, best_area, used = rect, area, True
+    kw.pop("search_scale", None)
+    for scale in scales:
+        for tol in tols:
+            rect, ok = typeset_rect(img, bbox, min_gain=min_gain, tol=tol,
+                                    search_scale=scale,
+                                    require_enclosed=require_enclosed, **kw)
+            if not ok:
+                continue
+            area = (rect[2] - rect[0]) * (rect[3] - rect[1])
+            if area > best_area:
+                best, best_area, used = rect, area, True
     return (best, True) if used else ((x1, y1, x2, y2), False)
 
 
-def typeset_rect(img, bbox, min_gain=1.15, **kw):
+def typeset_rect(img, bbox, min_gain=1.15, require_enclosed=False, **kw):
     """조판할 사각형을 돌려준다. 말풍선을 못 찾으면 원래 박스를 그대로.
 
     min_gain: 말풍선에서 얻은 사각형이 원래 박스보다 이 배수 이상 넓어야 채택한다.
@@ -171,7 +190,8 @@ def typeset_rect(img, bbox, min_gain=1.15, **kw):
     if rect is None:
         return base, False
 
-    sx1, sy1, _, _ = win
+    sx1, sy1 = win[0], win[1]
+    enclosed = win[4] if len(win) > 4 else True
     rx1, ry1, rx2, ry2 = rect[0] + sx1, rect[1] + sy1, rect[2] + sx1, rect[3] + sy1
     area = max(1, (rx2 - rx1) * (ry2 - ry1))
     if area < base_area * min_gain:
@@ -179,4 +199,4 @@ def typeset_rect(img, bbox, min_gain=1.15, **kw):
     # 원래 글자 자리를 포함하지 않으면 엉뚱한 곳을 잡은 것이다.
     if not (rx1 <= (x1 + x2) // 2 <= rx2 and ry1 <= (y1 + y2) // 2 <= ry2):
         return base, False
-    return (rx1, ry1, rx2, ry2), True
+    return (rx1, ry1, rx2, ry2), (True if not require_enclosed else enclosed)

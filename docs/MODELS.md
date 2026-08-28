@@ -180,16 +180,32 @@ maid2 77페이지(대사 283개)처럼 표본이 큰 소재에서 한 번 더 �
 
 ## 현재 배치
 
-`config/config.json` 의 `stages`:
+> ⚠ **이 문서는 llama.cpp + GGUF 회차의 기록이다.** vLLM 6개 모델의 종단간 실측은
+> [ENGINES.md §14](ENGINES.md#14--종단간-실측--vllm-6개-모델-전부-2026-08-27) 에 있고,
+> 엔진·모델·양자화가 동시에 바뀌었으므로 **아래 숫자와 나란히 두면 안 된다.**
 
-| 단계 | 모델 | 근거 |
-|---|---|---|
-| `read_page`, `read_texts` | `qwen-vl` | 문자 정확도 최고(98.2%), 동률 중 최속 |
-| `styleguide`, `translate`, `repair`, `judge` | `gemma` | 텍스트 추론·번역 담당 |
+`config/config.json` 의 `stages` 는 전 단계를 **`v-qwen38-fp4`** 하나로 둔다
+([ENGINES.md §14](ENGINES.md#14--종단간-실측--vllm-6개-모델-전부-2026-08-27) 판정).
+아래 llama.cpp 2모델 구성(`qwen-vl` + `gemma`)은 여전히 유효한 대안이지만, 그
+숫자들은 다른 엔진·다른 양자화에서 얻은 것이다.
 
-바꾸려면 `config/models.ini` 에 섹션을 추가하고 `python3 tools/sync_models.py` 로
-`config.json` 을 다시 만든 다음 `stages` 를 손으로 고친다. 한 번 실행에서만 바꿔 보려면
-`pipeline.py --model-read` / `--model-text` 를 쓴다.
+### 모델을 고르는 법
+
+**이 파이프라인은 LLM 서버를 띄우지 않는다.** 로컬(vLLM·llama.cpp)이든 원격
+(OpenAI·OpenRouter)이든 OpenAI 호환 주소 하나로만 본다 —
+[ENGINES.md §15](ENGINES.md#15--서버-통제를-버렸다--2026-08-27). 로컬 백엔드를 쓸
+생각이면 **먼저 직접 띄워 두어야 한다.**
+
+```bash
+./run_autoscribe.sh                    # 입력 디렉터리만 묻는다
+./run_autoscribe.sh ep11_cn --model <모델 id>
+```
+
+`--model` 은 별칭과 모델 id 를 둘 다 받는다. 판독과 텍스트를 나누려면
+`--model-read` / `--model-text` 가 이긴다.
+
+`config/config.json` 은 **역할 둘**이 전부다 — `read`(② 판독) 와 `translate`(④⑤⑥),
+각각 `base_url` · `api_key_env` · `model` 세 개. 기동 인자는 적지 않는다.
 
 ---
 

@@ -30,7 +30,7 @@ from PIL import Image, ImageDraw, ImageFont
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bubble import typeset_rect_multi  # noqa: E402
 from glyph_size import measure_from_mask  # noqa: E402
-from make_mask import mask_for_box  # noqa: E402
+from make_mask import mask_for_box, residual_ratio  # noqa: E402
 
 DEFAULT_FONT = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 
@@ -367,10 +367,19 @@ def fit_at_base(draw, text, box_w, box_h, font_path, base_size, fill,
 
 def main():
     p = argparse.ArgumentParser(description="지우기 + 번역문 조판")
+    p.add_argument("--log", help="이 경로에 전체 로그를 덧붙인다")
     p.add_argument("--translated-json", required=True)
     p.add_argument("--out-dir", required=True)
     p.add_argument("--pages", type=int, nargs="+")
     p.add_argument("--font", default=DEFAULT_FONT)
+    p.add_argument("--no-mask-bubble", dest="mask_bubble", action="store_false",
+                   help="말풍선 안까지 훑지 않고 텍스트 박스만 지운다")
+    p.add_argument("--min-area", type=int, default=12,
+                   help="이보다 작은 연결요소는 노이즈로 본다 (해상도에 비례해 커진다)")
+    p.add_argument("--residual-max", type=float, default=0.35,
+                   help="마스크가 못 덮은 글자 엣지 비율이 이보다 크면 박스 전체를 덮는다")
+    p.add_argument("--no-residual-fill", dest="residual_fill", action="store_false",
+                   help="잔여가 있어도 덮지 않는다 (측정만)")
     p.add_argument("--inpaint", choices=["telea", "ns", "none"], default="telea",
                    help="고전 인페인팅 방식. none 이면 지우기만 하고 메우지 않는다")
     p.add_argument("--inpaint-radius", type=int, default=5)
@@ -393,10 +402,13 @@ def main():
                    help="말풍선 검출을 끄고 텍스트 박스에 그대로 조판한다")
     p.add_argument("--bubble-tol", type=int, default=18,
                    help="flood fill 색 허용치. 크면 말풍선 밖으로 샌다")
-    p.add_argument("--skip-kinds", nargs="*", default=["sfx"],
+    p.add_argument("--skip-kinds", nargs="*", default=["sfx", "credits"],
                    help="이 종류는 지우지도 얹지도 않는다 (효과음은 조판이 따로 필요)")
     args = p.parse_args()
 
+    import sys as _s, os as _o
+    _s.path.insert(0, _o.path.join(_o.path.dirname(_o.path.dirname(_o.path.abspath(__file__))), 'vlm'))
+    import progress as _P; _P.open_log(getattr(args, 'log', None))
     doc = json.load(open(args.translated_json, encoding="utf-8"))
     os.makedirs(args.out_dir, exist_ok=True)
     inpaint_flag = {"telea": cv2.INPAINT_TELEA, "ns": cv2.INPAINT_NS}.get(args.inpaint)
@@ -420,6 +432,7 @@ def main():
         if chapter_base:
             print(f"챕터 기준 글자 크기 {chapter_base * args.size_scale:.0f}px [{src}]")
 
+    residual_total = 0
     for pg in doc["pages"]:
         pno = pg["index"] + 1
         if args.pages and pno not in args.pages:
@@ -439,11 +452,41 @@ def main():
         # ⑦ 마스크 — 지울 대상만 모은다
         mask = np.zeros((H, W), np.uint8)
         for t in targets:
-            m, box = mask_for_box(img, t["bbox"], 0.12, 12, 0.35, 3, 5)
-            if m is None:
-                continue
-            cx1, cy1, cx2, cy2 = box
-            mask[cy1:cy2, cx1:cx2] = cv2.bitwise_or(mask[cy1:cy2, cx1:cx2], m)
+            # 박스 하나만 보면 **같은 말풍선 안의 다른 글자**가 남는다. 실측
+            # (maid2 12쪽): `主人` 은 `早安` 과 한 말풍선인데 Magi 가 별개 박스로
+            # 잡거나 아예 놓쳐서 100% 그대로 남았다. 어차피 그 말풍선을 한국어로
+            # 덮을 거라면 **말풍선 안을 통째로** 훑어야 한다.
+            #
+            # 다만 말풍선 영역'만' 쓰면 안 된다. 크롭이 커지면서 Otsu 문턱이
+            # 헐거워져 정작 원래 글자를 놓친다(잔여 초과 1 → 3). 그래서 **합집합**
+            # 이다: 박스는 국소 대비로 확실히, 말풍선은 놓친 글자를 줍는다.
+            regions = [t["bbox"]]
+            if args.mask_bubble:
+                # 마스크에는 **가둠이 확인된 말풍선만** 쓴다. 조판 자리와 달리
+                # 여기서는 새어 나간 영역이 곧 그림 손상이다.
+                rect, ok = typeset_rect_multi(img, t["bbox"], require_enclosed=True)
+                if ok:
+                    regions.append(list(rect))
+            for bb in regions:
+                m, box = mask_for_box(img, bb, 0.12, args.min_area, 0.35, 3, 5)
+                if m is None:
+                    continue
+                cx1, cy1, cx2, cy2 = box
+                mask[cy1:cy2, cx1:cx2] = cv2.bitwise_or(mask[cy1:cy2, cx1:cx2], m)
+
+        # 마스크가 덮지 못한 글자가 남았는지 **재고**, 임계를 넘으면 그 박스는
+        # 통째로 덮는다. "원문이 일부 안 지워진다" 는 지금까지 육안으로만 알 수
+        # 있었고, 그래서 고쳤는지도 알 수 없었다. 여기가 실제 조판 경로다 —
+        # make_mask.py 단독 실행이 아니라.
+        leftover = []
+        for t in targets:
+            r = residual_ratio(img, mask, t["bbox"])
+            if r > args.residual_max:
+                leftover.append((t.get("id"), r))
+                if args.residual_fill:
+                    bx1, by1, bx2, by2 = (int(round(v)) for v in t["bbox"])
+                    mask[max(0, by1):min(H, by2), max(0, bx1):min(W, bx2)] = 255
+        residual_total += len(leftover)
 
         # ⑧ 인페인팅
         if inpaint_flag is not None:
@@ -511,8 +554,12 @@ def main():
         pil.convert("RGB").save(dest, quality=92)
         print(f"  p{pno:02d} 번역 {len(targets)}개 → 문단 {placed}개"
               f"{f' (합침 {merged})' if merged else ''} "
-              f"(말풍선 {widened}, 넘침 {overflow}) | "
+              f"(말풍선 {widened}, 넘침 {overflow})"
+              f"{f' | 잔여 {len(leftover)}개' if leftover else ''} | "
               f"마스크 {100.0*(mask>0).sum()/(H*W):.2f}% → {dest}")
+    if residual_total:
+        print(f"\n마스크가 못 덮어 박스 전체로 덮은 곳 {residual_total}개"
+              f"{'' if args.residual_fill else ' (측정만, 덮지 않음)'}")
     return 0
 
 

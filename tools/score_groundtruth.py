@@ -231,13 +231,23 @@ def main():
           f"({100*matched/max(tot,1):.0f}%)")
     print(f"검출 누락 {box_under}개 | 말풍선 밖 박스 {box_over}개")
 
+    # 표본이 0 이면 비율이 아니라 **측정 불가**다. max(n,1) 로 나누면 0/0 이
+    # 100% 로 나와서 **완전히 실패한 실행이 만점으로 보인다.** 실제로 당했다 —
+    # 추론을 켠 실행에서 전사가 전부 영어 사고문이라 짝이 하나도 안 지어졌는데
+    # "문자 정확도 100.0%" 가 찍혔다.
     if args.mode == "transcription":
-        cer = ed_sum / max(ch_sum, 1)
-        print(f"\n완전일치 {exact}/{matched} ({100*exact/max(matched,1):.0f}%)")
-        print(f"문자오류율(CER) {100*cer:.1f}%  → 문자 정확도 {100*(1-cer):.1f}%")
+        print(f"\n완전일치 {exact}/{matched}"
+              + (f" ({100*exact/matched:.0f}%)" if matched else " (측정 불가)"))
+        if ch_sum:
+            cer = ed_sum / ch_sum
+            print(f"문자오류율(CER) {100*cer:.1f}%  → 문자 정확도 {100*(1-cer):.1f}%")
+        else:
+            print("문자 정확도 측정 불가 — 짝지어진 박스가 없습니다 "
+                  "(전사가 통째로 어긋났거나 정렬이 실패했다는 뜻이다)",
+                  file=sys.stderr)
     else:
-        print(f"\n말투 비교 가능 {reg_cmp}개 | 일치 {reg_same}개 "
-              f"({100*reg_same/max(reg_cmp,1):.0f}%)")
+        print(f"\n말투 비교 가능 {reg_cmp}개 | 일치 {reg_same}개"
+              + (f" ({100*reg_same/reg_cmp:.0f}%)" if reg_cmp else " (측정 불가)"))
 
     if samples and args.show:
         print(f"\n어긋난 사례 (앞 {min(args.show, len(samples))}개):")
